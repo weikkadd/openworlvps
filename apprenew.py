@@ -15,8 +15,14 @@ import numpy as np
 from playwright.sync_api import sync_playwright
 
 # ================= 配置区 =================
-# 从 GitHub Secrets 环境变量获取 Discord Token
+# ---- 多账号配置（按优先级自动加载，任选其一） ----
+# 1. 环境变量 DISCORD_TOKENS：JSON 数组字符串
+#    DISCORD_TOKENS='[{"name":"账号1","token":"xxxx"},{"name":"账号2","token":"yyyy"}]'
+# 2. 环境变量 DISCORD_TOKEN_1 / DISCORD_TOKEN_2 / ...（编号自动收集）
+# 3. 本地 accounts.json 文件（与 DISCORD_TOKENS 同结构，适合本地运行）
+# 4. 单个 DISCORD_TOKEN（旧版单账号兼容）
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+ACCOUNTS_FILE = os.environ.get("ACCOUNTS_FILE", "accounts.json")
 
 # TG 通知（可选）
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
@@ -32,6 +38,86 @@ RENEW_THRESHOLD_DAYS = 5
 
 # 截图保存目录（调试用）
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
+
+
+def mask_token(token: str) -> str:
+    """打码显示 token，避免日志泄露"""
+    if len(token) <= 8:
+        return "***"
+    return token[:4] + "***" + token[-4:]
+
+
+def load_accounts() -> list:
+    """
+    按优先级加载多账号配置：
+    1. DISCORD_TOKENS（JSON 数组）
+    2. DISCORD_TOKEN_1 ~ DISCORD_TOKEN_N（编号）
+    3. accounts.json 本地文件
+    4. 单个 DISCORD_TOKEN（旧版兼容）
+    """
+    accounts = []
+
+    def _append(data, base_index):
+        """从 JSON 数据中提取账号（支持 {name, token} 字典或纯 token 字符串）"""
+        out = []
+        for i, item in enumerate(data, base_index):
+            if isinstance(item, str):
+                out.append({"name": f"账号{i}", "token": item.strip()})
+            elif isinstance(item, dict):
+                name = str(item.get("name") or f"账号{i}").strip()
+                token = str(item.get("token", "")).strip()
+                out.append({"name": name, "token": token})
+        return out
+
+    # 1. DISCORD_TOKENS 环境变量（JSON）
+    tokens_json = os.environ.get("DISCORD_TOKENS", "").strip()
+    if tokens_json:
+        try:
+            data = json.loads(tokens_json)
+            if isinstance(data, list):
+                accounts = _append(data, 1)
+                print(f"✅ 从 DISCORD_TOKENS 加载 {len(accounts)} 个账号")
+        except Exception as e:
+            print(f"⚠️ DISCORD_TOKENS 解析失败: {e}")
+
+    # 2. DISCORD_TOKEN_N 编号环境变量
+    if not accounts:
+        i = 1
+        while True:
+            tok = os.environ.get(f"DISCORD_TOKEN_{i}", "").strip()
+            if not tok:
+                break
+            accounts.append({"name": f"账号{i}", "token": tok})
+            i += 1
+        if accounts:
+            print(f"✅ 从 DISCORD_TOKEN_1..{i-1} 加载 {len(accounts)} 个账号")
+
+    # 3. 本地 accounts.json
+    if not accounts and os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data = data.get("accounts", [])
+            if isinstance(data, list):
+                accounts = _append(data, 1)
+                print(f"✅ 从 {ACCOUNTS_FILE} 加载 {len(accounts)} 个账号")
+        except Exception as e:
+            print(f"⚠️ {ACCOUNTS_FILE} 解析失败: {e}")
+
+    # 4. 旧版单账号兼容
+    if not accounts and DISCORD_TOKEN:
+        accounts = [{"name": "账号1", "token": DISCORD_TOKEN.strip()}]
+        print("✅ 使用单个 DISCORD_TOKEN（旧版兼容模式）")
+
+    # 去重 + 过滤空 token
+    seen, result = set(), []
+    for acc in accounts:
+        if not acc["token"] or acc["token"] in seen:
+            continue
+        seen.add(acc["token"])
+        result.append(acc)
+    return result
 
 
 def send_telegram_message(message: str):
@@ -737,19 +823,175 @@ def get_vps_urls(page) -> list:
     return vps_urls
 
 
+def process_account(browser, account):
+    """
+    处理单个账号：独立浏览器上下文 -> 登录 -> 检测 VPS -> 逐台续期。
+    返回统计字典，单账号异常不会影响其他账号。
+    """
+    name = account["name"]
+    token = account["token"]
+
+    print(f"\n{'#' * 60}")
+    print(f"# 🧑‍💻 处理账号: {name}")
+    print(f"{'#' * 60}")
+
+    # 每个账号使用独立 context，隔离 cookie/缓存
+    context = browser.new_context(
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        viewport={"width": 1280, "height": 720},
+    )
+    page = context.new_page()
+
+    stats = {"name": name, "status": "未知", "vps": 0, "renewed": 0, "skipped": 0, "failed": 0}
+
+    try:
+        # ========== 登录 ==========
+        success = login_with_discord_token(page, token)
+
+        if not success:
+            print(f"\n❌ [{name}] 登录流程失败，跳过该账号。")
+            send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 登录流程失败")
+            stats["status"] = "登录失败"
+            return stats
+
+        # ========== 自动检测 VPS 列表 ==========
+        target_vps_list = get_vps_urls(page)
+        stats["vps"] = len(target_vps_list)
+
+        if not target_vps_list:
+            print(f"\n❌ [{name}] 未能从面板自动检测到任何 VPS 实例。")
+            print("💡 请检查账号是否有活跃的 VPS 实例")
+            save_screenshot(page, "no_vps_found")
+            send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 未在面板找到任何 VPS 实例")
+            stats["status"] = "无VPS实例"
+            return stats
+
+        # 遍历每个 VPS 实例进行续期检测
+        for idx, target_url in enumerate(target_vps_list, 1):
+            print(f"\n{'=' * 50}")
+            print(f"📌 [{name}] [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
+            print(f"{'=' * 50}")
+
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"⚠️ 页面加载异常: {e}")
+
+            wait_for_cloudflare(page)
+            time.sleep(3)
+
+            current_url = page.url
+            page_title = page.title()
+            print(f"📝 当前 URL: {current_url}")
+            print(f"📝 页面标题: {page_title}")
+
+            # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
+            if "/login" in current_url:
+                print("❌ 被重定向到登录页，Cookie 可能无效")
+                save_screenshot(page, f"redirect_to_login_{name}_{idx}")
+                send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 登录后仍被重定向到登录页")
+                stats["failed"] += 1
+                break
+
+            page_text = page.locator("body").inner_text()
+
+            # 检查是否 404 Page Not Found
+            if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
+                print(f"❌ [{name}] 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
+                print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
+                save_screenshot(page, f"vps_404_{name}_{idx}")
+                send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 页面 404 Not Found\nURL: {target_url}")
+                stats["failed"] += 1
+                continue
+
+            if "/vps/" not in current_url:
+                print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
+                save_screenshot(page, f"not_vps_page_{name}_{idx}")
+
+            print("✅ 已成功到达目标 VPS 页面")
+            save_screenshot(page, f"vps_page_loaded_{name}_{idx}")
+
+            # ========== 检查剩余天数 ==========
+            match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+
+            if match:
+                days_left = int(match.group(1))
+                print(f"🔍 [{name}] 当前 VPS 剩余续期时间: {days_left} 天")
+
+                if days_left > RENEW_THRESHOLD_DAYS:
+                    msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
+                    print(msg)
+                    send_telegram_message(f"ℹ️ Openworld 无需续期\n账号: {name}\n实例: {target_url}\n剩余时间: {days_left} 天")
+                    stats["skipped"] += 1
+                    continue
+                else:
+                    print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
+            else:
+                print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
+                print(f"   页面文本片段: {page_text[:500]}")
+                days_left = 0  # 未知天数，强制尝试续期
+
+            # ========== 执行续期 ==========
+            print(f"\n{'=' * 50}")
+            print("🔄 开始执行验证码续期")
+            print(f"{'=' * 50}")
+
+            renew_success = try_renew_captcha(page, initial_days=days_left)
+
+            if renew_success:
+                # 计算续期后的到期时间（当前时间 + 6天）
+                expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
+                expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                msg = f"✅ Openworld 续期成功！\n账号: {name}\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
+                print(f"✅ 续期成功！天数已更新为 6 天")
+                print(f"📅 续期至: {expiry_str}")
+                send_telegram_message(msg)
+                stats["renewed"] += 1
+            else:
+                print("❌ 续期失败（5次尝试均未成功）")
+                send_telegram_message(f"❌ Openworld 续期失败：5次验证码尝试均未成功\n账号: {name}\n实例: {target_url}")
+                stats["failed"] += 1
+
+        stats["status"] = "完成"
+        return stats
+
+    except Exception as e:
+        print(f"\n💥 [{name}] 账号处理发生未捕获异常: {e}")
+        import traceback
+        traceback.print_exc()
+        save_screenshot(page, f"uncaught_error_{name}")
+        send_telegram_message(f"❌ Openworld 续期脚本异常（账号 {name}）: {str(e)[:200]}")
+        stats["status"] = f"异常: {str(e)[:50]}"
+        return stats
+
+    finally:
+        context.close()
+
+
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期脚本")
+    print("   Openworld VPS 自动续期脚本（多账号版）")
     print("#" * 50)
 
-    if not DISCORD_TOKEN:
-        print("❌ 未找到 DISCORD_TOKEN 环境变量，请检查配置。")
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未找到任何账号配置，请检查：")
+        print("   1. 环境变量 DISCORD_TOKENS（JSON 数组）")
+        print("   2. 环境变量 DISCORD_TOKEN_1 / DISCORD_TOKEN_2 ...（编号）")
+        print("   3. 本地 accounts.json 文件")
+        print("   4. 单个 DISCORD_TOKEN（旧版兼容）")
         sys.exit(1)
+
+    print(f"👥 共加载 {len(accounts)} 个账号:")
+    for acc in accounts:
+        print(f"   - {acc['name']}: {mask_token(acc['token'])}")
 
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
-    print("🎯 登录后将自动从面板检测 VPS 实例")
+    print("🎯 每个账号登录后将自动从面板检测 VPS 实例并逐一续期")
 
+    results = []
     with sync_playwright() as p:
         # 使用更真实的浏览器配置以避免被检测
         browser = p.chromium.launch(
@@ -760,125 +1002,42 @@ def main():
                 "--disable-dev-shm-usage",
             ]
         )
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-            viewport={"width": 1280, "height": 720},
-        )
-        page = context.new_page()
-
         try:
-            # ========== 登录 ==========
-            success = login_with_discord_token(page, DISCORD_TOKEN)
-
-            if not success:
-                print("\n❌ 登录流程失败，脚本退出。")
-                send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
-                browser.close()
-                return
-
-            # ========== 自动检测 VPS 列表 ==========
-            target_vps_list = get_vps_urls(page)
-
-            if not target_vps_list:
-                print("\n❌ 未能从面板自动检测到任何 VPS 实例。")
-                print("💡 请检查账号是否有活跃的 VPS 实例")
-                save_screenshot(page, "no_vps_found")
-                send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
-                browser.close()
-                return
-
-            # 遍历每个 VPS 实例进行续期检测
-            for idx, target_url in enumerate(target_vps_list, 1):
-                print(f"\n{'=' * 50}")
-                print(f"📌 [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
-                print(f"{'=' * 50}")
-
-                try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                except Exception as e:
-                    print(f"⚠️ 页面加载异常: {e}")
-
-                wait_for_cloudflare(page)
-                time.sleep(3)
-
-                current_url = page.url
-                page_title = page.title()
-                print(f"📝 当前 URL: {current_url}")
-                print(f"📝 页面标题: {page_title}")
-
-                # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
-                if "/login" in current_url:
-                    print("❌ 被重定向到登录页，Cookie 可能无效")
-                    save_screenshot(page, f"redirect_to_login_{idx}")
-                    send_telegram_message("❌ Openworld VPS 续期失败：登录后仍被重定向到登录页")
-                    break
-
-                page_text = page.locator("body").inner_text()
-
-                # 检查是否 404 Page Not Found
-                if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
-                    print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
-                    print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
-                    save_screenshot(page, f"vps_404_{idx}")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：页面 404 Not Found\nURL: {target_url}")
-                    continue
-
-                if "/vps/" not in current_url:
-                    print(f"⚠️ 当前页面可能不是 VPS 详情页: {current_url}")
-                    save_screenshot(page, f"not_vps_page_{idx}")
-
-                print("✅ 已成功到达目标 VPS 页面")
-                save_screenshot(page, f"vps_page_loaded_{idx}")
-
-                # ========== 检查剩余天数 ==========
-                match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
-
-                if match:
-                    days_left = int(match.group(1))
-                    print(f"🔍 当前 VPS 剩余续期时间: {days_left} 天")
-
-                    if days_left > RENEW_THRESHOLD_DAYS:
-                        msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
-                        print(msg)
-                        send_telegram_message(f"ℹ️ Openworld VPS 无需续期\n实例: {target_url}\n剩余时间: {days_left} 天")
-                        continue
-                    else:
-                        print(f"⚠️ 剩余 {days_left} 天 ≤ {RENEW_THRESHOLD_DAYS} 天，开始执行续期...")
-                else:
-                    print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
-                    print(f"   页面文本片段: {page_text[:500]}")
-                    days_left = 0  # 未知天数，强制尝试续期
-
-                # ========== 执行续期 ==========
-                print(f"\n{'=' * 50}")
-                print("🔄 开始执行验证码续期")
-                print(f"{'=' * 50}")
-
-                renew_success = try_renew_captcha(page, initial_days=days_left)
-
-                if renew_success:
-                    # 计算续期后的到期时间（当前时间 + 6天）
-                    expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
-                    expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                    msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
-                    print(f"✅ 续期成功！天数已更新为 6 天")
-                    print(f"📅 续期至: {expiry_str}")
-                    send_telegram_message(msg)
-                else:
-                    print("❌ 续期失败（5次尝试均未成功）")
-                    send_telegram_message(f"❌ Openworld VPS 续期失败：5次验证码尝试均未成功\n实例: {target_url}")
-
+            # 串行处理每个账号（各自独立 context，cookie 互不干扰）
+            for acc in accounts:
+                results.append(process_account(browser, acc))
         except Exception as e:
             print(f"\n💥 脚本发生未捕获异常: {e}")
             import traceback
             traceback.print_exc()
-            save_screenshot(page, "uncaught_error")
-            send_telegram_message(f"❌ Openworld VPS 续期脚本异常: {str(e)[:200]}")
-
         finally:
             browser.close()
-            print("\n🏁 脚本执行完毕")
+
+    # ========== 汇总统计 ==========
+    print("\n" + "#" * 60)
+    print("📊 多账号执行汇总")
+    print("#" * 60)
+
+    summary_lines = []
+    for r in results:
+        line = (f"👤 {r['name']}: 状态={r['status']} | VPS={r['vps']} | "
+                f"续期成功={r['renewed']} | 跳过={r['skipped']} | 失败={r['failed']}")
+        print("  " + line)
+        summary_lines.append(line)
+
+    total_vps = sum(r["vps"] for r in results)
+    total_renewed = sum(r["renewed"] for r in results)
+    total_failed = sum(r["failed"] for r in results)
+    print(f"\n🏁 全部执行完毕: {len(results)} 个账号, 共 {total_vps} 台 VPS, "
+          f"成功续期 {total_renewed} 台, 失败 {total_failed} 台")
+
+    if len(results) > 1:
+        summary_msg = "📊 Openworld 多账号续期汇总\n" + "\n".join(summary_lines)
+        send_telegram_message(summary_msg)
+
+    # 有失败项时以非零退出码结束，便于在 GitHub Actions 中标记失败
+    if total_failed > 0:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

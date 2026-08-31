@@ -29,6 +29,13 @@ jobs:
 
       - name: 🚀 运行 Openworld 续期脚本
         env:
+          # 多账号（推荐）：JSON 数组 [{"name":"账号1","token":"xxx"},...]
+          DISCORD_TOKENS: ${{ secrets.DISCORD_TOKENS }}
+          # 或使用编号形式：DISCORD_TOKEN_1 / DISCORD_TOKEN_2 / ...
+          DISCORD_TOKEN_1: ${{ secrets.DISCORD_TOKEN_1 }}
+          DISCORD_TOKEN_2: ${{ secrets.DISCORD_TOKEN_2 }}
+          DISCORD_TOKEN_3: ${{ secrets.DISCORD_TOKEN_3 }}
+          # 旧版单账号兼容（三选一即可）
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}

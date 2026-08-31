@@ -1,0 +1,13 @@
+# 本地账号配置（含真实 Discord Token，切勿提交！）
+accounts.json
+
+# 验证码截图 / GIF（调试产物）
+*.gif
+*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行时产物
+artifacts/

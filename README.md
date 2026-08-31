@@ -6,13 +6,14 @@
 
 ## 🌟 功能特性
 
+- 👥 **多账号支持**：一个脚本同时续期多个 Discord 账号下的所有 VPS，自动串行处理、互不影响。
 - 🔑 **Discord OAuth 免干预登录**：利用账号的 `DISCORD_TOKEN` 向 Discord API 提交直接授权，跳过复杂的网页交互。
 - 🧩 **多帧 GIF 算式验证码识别**：
   - 自动在浏览器上下文中获取 `blob:` 类型的多帧 GIF 动态验证码。
   - **拆帧 + 分区切割**：提取 GIF 的所有帧，将画面切割为左半区（数字A）、中区（运算符）、右半区（数字B）。
   - **模糊映射与跨帧投票**：清洗字符并映射误识别符号，利用跨帧概率统计得出高准确度的算式并自动计算结果。
 - ⏱️ **智能天数检测**：自动解析面板当前的剩余到期天数，仅当剩余时间 `<= 5 天` 时才触发续期，避免无谓请求。
-- 📢 **Telegram 结果通知**：可选配置 Telegram Bot，续期成功或失败时自动推送最新状态。
+- 📢 **Telegram 结果通知**：可选配置 Telegram Bot，每个账号的成功/失败状态实时推送，最后附带全部账号汇总。
 - 📸 **自动保存验证码GIF**：自动保存验证码GIF，在 GitHub Actions 中保存为 Artifacts 便于排查。
 
 ---
@@ -21,14 +22,39 @@
 
 在 GitHub 仓库依次点击 **Settings** ➔ **Secrets and variables** ➔ **Actions** ➔ **New repository secret** 配置以下变量：
 
+### 多账号配置（三选一）
+
 | Secret 名称 | 是否必填 | 说明 |
 | :--- | :---: | :--- |
-| `DISCORD_TOKEN` | **必填** | 你的 Discord 账号授权 Token（获取方式见下文） |
+| `DISCORD_TOKENS` | ⭐ 推荐 | 所有账号的 JSON 数组，格式见下文 |
+| `DISCORD_TOKEN_1` / `DISCORD_TOKEN_2` / ... | 可选 | 编号形式，脚本自动收集所有 `DISCORD_TOKEN_N` |
+| `DISCORD_TOKEN` | ❌ 旧版 | 单个账号（旧版兼容，多账号时不推荐） |
+
+**`DISCORD_TOKENS` 格式**（一次配置所有账号，可自定义每个账号名称，便于通知区分）：
+
+```json
+[
+  {"name": "主账号", "token": "你的Discord_Token_1"},
+  {"name": "小号A", "token": "你的Discord_Token_2"},
+  {"name": "小号B", "token": "你的Discord_Token_3"}
+]
+```
+
+> 单个 Secret 的值就是上面这一整段 JSON。`name` 可省略，省略时自动命名为「账号1、账号2…」。
+
+### 通知配置（可选）
+
+| Secret 名称 | 是否必填 | 说明 |
+| :--- | :---: | :--- |
 | `TG_BOT_TOKEN` | ❌ 可选 | Telegram Bot Token（用于接收续期结果通知） |
 | `TG_CHAT_ID` | ❌ 可选 | Telegram Chat ID（接收通知的用户或群组 ID） |
 
+### 本地运行方式
+
+不使用 GitHub Actions 时，也可在脚本同目录放置 `accounts.json` 文件（内容与上方 JSON 数组一致，或用 `{"accounts": [...]}` 包裹），脚本会自动读取。
+
 > [!NOTE]
-> 无需手动配置 VPS 地址，脚本登录后会**自动从面板检测**账号下所有 VPS 实例并逐一续期。
+> 无需手动配置 VPS 地址，脚本登录后会**自动从面板检测**每个账号下的所有 VPS 实例并逐一续期。
 
 ---
 
@@ -36,12 +62,12 @@
 
 1. **Fork 本仓库** 到你自己的 GitHub 账号下。
 2. **开启 Actions 权限**：在仓库的 **Actions** 标签页中点击按钮允许运行工作流。
-3. **添加 Secrets**：在 **Settings ➔ Secrets and variables ➔ Actions** 中添加 `DISCORD_TOKEN`（如需 Telegram 通知，同时添加 `TG_BOT_TOKEN` 和 `TG_CHAT_ID`）。
+3. **添加 Secrets**：在 **Settings ➔ Secrets and variables ➔ Actions** 中添加账号配置（推荐 `DISCORD_TOKENS`，多个账号一次搞定）。如需 Telegram 通知，同时添加 `TG_BOT_TOKEN` 和 `TG_CHAT_ID`。
 4. **手动测试运行**：
    - 进入 **Actions** 标签页。
    - 选择左侧的 **Auto Renew Openworld VPS** 工作流。
    - 点击 **Run workflow** 按钮启动测试。
-5. **定时自动运行**：工作流默认每 2 天自动触发运行一次，实现完全无人值守。
+5. **查看结果**：Actions 日志会依次打印每个账号的处理过程，最后输出全部账号的汇总统计（续期成功/跳过/失败台数）。
 
 ---
 

@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "name": "主账号",
+      "token": "你的Discord_Token_1"
+    },
+    {
+      "name": "小号A",
+      "token": "你的Discord_Token_2"
+    },
+    {
+      "name": "小号B",
+      "token": "你的Discord_Token_3"
+    }
+  ]
+}
