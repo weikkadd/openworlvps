@@ -34,10 +34,16 @@
 
 ```json
 [
-  {"name": "主账号", "token": "你的Discord_Token_1"},
-  {"name": "小号A", "token": "你的Discord_Token_2"},
-  {"name": "小号B", "token": "你的Discord_Token_3"}
+  {
+    "name": "主号",
+    "token": "MTUwNDcxNDMwNTIzNTMyNTA0MA.GvKlrR.7MlK11uoOIK"
+  },
+  {
+    "name": "小号A",
+    "token": "另一个账号的Token"
+  }
 ]
+
 ```
 
 > 单个 Secret 的值就是上面这一整段 JSON。`name` 可省略，省略时自动命名为「账号1、账号2…」。
