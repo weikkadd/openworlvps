@@ -385,13 +385,101 @@ def preprocess_frame(img: Image.Image) -> Image.Image:
     return binary
 
 
+def _split_segments(frame):
+    """按列投影自动切分一帧为若干字形段 (不依赖固定百分比/不重叠)
+
+    返回 [(x0, x1, crop), ...], crop 为带边距的字形图像。
+    """
+    w, h = frame.size
+    binary = frame.point(lambda p: 0 if p < 170 else 255, "L")
+    px = binary.load()
+    col_sum = []
+    for x in range(w):
+        cnt = 0
+        for y in range(h):
+            if px[x, y] < 128:
+                cnt += 1
+        col_sum.append(cnt)
+
+    segs = []
+    start = None
+    for x in range(w):
+        if col_sum[x] > 0:
+            if start is None:
+                start = x
+        else:
+            if start is not None:
+                segs.append([start, x - 1])
+                start = None
+    if start is not None:
+        segs.append([start, w - 1])
+    if not segs:
+        return []
+
+    # 合并间隙 <= 2px 的相邻段 (笔画断裂/噪点)
+    merged = [segs[0]]
+    for s in segs[1:]:
+        if s[0] - merged[-1][1] <= 2:
+            merged[-1][1] = s[1]
+        else:
+            merged.append(s)
+
+    crops = []
+    for x0, x1 in merged:
+        l = max(0, x0 - 3)
+        r = min(w, x1 + 3)
+        crops.append((x0, x1, frame.crop((l, 0, r, h))))
+    return crops
+
+
+def _classify_segment_text(res):
+    """把 ddddocr 识别结果分类为 数字 / 运算符 / 混合
+
+    返回 (kind, value):
+      - ("num", "12")  纯数字
+      - ("op", "*")    运算符
+      - ("mixed", (digits, ops))  数字和运算符粘连
+      - ("unknown", raw)
+    """
+    s = (res or "").strip()
+    if not s:
+        return ("unknown", "")
+    replaced = (s.replace('O', '0').replace('o', '0').replace('l', '1')
+                 .replace('I', '1').replace('S', '5').replace('s', '5')
+                 .replace('B', '8').replace('g', '9').replace('q', '9')
+                 .replace('z', '2').replace('Z', '2'))
+    if re.fullmatch(r'[0-9]+', replaced):
+        return ("num", replaced)
+
+    ops = ""
+    for ch in s:
+        if ch in "+-*/":
+            ops += ch
+        elif ch in ("x", "X", "×"):
+            ops += "*"
+        elif ch in ("÷", ":"):
+            ops += "/"
+        elif ch in ("一", "—", "–", "-"):
+            ops += "-"
+        elif ch in ("十", "t", "T"):
+            ops += "+"
+    digits = "".join(ch for ch in replaced if ch.isdigit())
+    if ops and digits:
+        return ("mixed", (digits, ops))
+    if ops:
+        return ("op", ops)
+    if digits:
+        return ("num", digits)
+    return ("unknown", s)
+
+
 def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     """
     分解帧识别验证码：
     1. 获取每一帧。
-    2. 对每一帧分为 Left（左半边，数字A）、Middle（中间，运算符）、Right（右半边，数字B）。
-    3. 过滤并只保留数字/运算符字符，跨帧统计出现频率最高的字符。
-    4. 组合成算式并计算结果。
+    2. 按列投影自动切分字形段 (代替固定百分比裁剪, 避免区域重叠误判)。
+    3. 逐段分类为数字/运算符, 按"运算符前=左数字, 运算符后=右数字"拼接。
+    4. 跨帧投票取最高频结果, 组合成算式并求解。
     """
     frames = extract_gif_frames(gif_bytes)
     if not frames:
@@ -402,49 +490,53 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     right_candidates = []  # 数字B候选
 
     for idx, frame in enumerate(frames):
-        w, h = frame.size
-        # 裁剪三个区域
-        left_crop = frame.crop((0, 0, int(w * 0.42), h))
-        mid_crop = frame.crop((int(w * 0.35), 0, int(w * 0.65), h))
-        right_crop = frame.crop((int(w * 0.58), 0, w, h))
+        segs = _split_segments(frame)
+        if not segs:
+            continue
 
-        for region_name, crop_img, cand_list in [
-            ("Left", left_crop, left_candidates),
-            ("Middle", mid_crop, op_candidates),
-            ("Right", right_crop, right_candidates)
-        ]:
-            proc_img = preprocess_frame(crop_img)
+        # 逐段识别并分类
+        seq = []  # [(kind, value), ...]
+        for x0, x1, crop in segs:
+            proc_img = preprocess_frame(crop)
             img_buf = io.BytesIO()
             proc_img.save(img_buf, format="PNG")
-            
-            # 使用 ddddocr 识别
             res = ocr.classification(img_buf.getvalue()).strip()
-            
-            # 清理非数字/运算符字符
-            if region_name in ("Left", "Right"):
-                # 只保留数字，统一模糊识别字符
-                res_clean = re.sub(r'[^0-9]', '', res.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('S', '5').replace('s', '5').replace('B', '8').replace('g', '9').replace('q', '9').replace('z', '2').replace('Z', '2'))
-            else:
-                # 运算符 region：匹配 + - * /
-                res_clean = ""
-                for char in res:
-                    if char in "+-*/":
-                        res_clean += char
-                    elif char in ("x", "X", "×"):
-                        res_clean += "*"
-                    elif char in ("÷", ":"):
-                        res_clean += "/"
-                    elif char in ("一", "—", "–"):
-                        res_clean += "-"
-                    elif char in ("十", "t", "T"):
-                        res_clean += "+"
+            if not res:
+                continue
+            kind, val = _classify_segment_text(res)
+            if kind == "num":
+                seq.append(("num", val))
+            elif kind == "op":
+                seq.append(("op", val))
+            elif kind == "mixed":
+                digits, ops = val
+                if digits:
+                    seq.append(("num", digits))
+                for o in ops:
+                    seq.append(("op", o))
 
-            if res_clean:
-                cand_list.append(res_clean)
+        if not seq:
+            continue
 
-    # 统计出现最高频的左数字、运算符、右数字
+        # 第一个运算符作为分界: 之前=左数字A, 之后=右数字B
+        op_idx = None
+        for i, (k, v) in enumerate(seq):
+            if k == "op":
+                op_idx = i
+                break
+        if op_idx is None:
+            continue
+        num_a = "".join(v for k, v in seq[:op_idx] if k == "num")
+        num_b = "".join(v for k, v in seq[op_idx + 1:] if k == "num")
+        op = seq[op_idx][1]
+        if num_a and num_b:
+            left_candidates.append(num_a)
+            op_candidates.append(op)
+            right_candidates.append(num_b)
+
+    # 跨帧统计最高频的左数字、运算符、右数字
     from collections import Counter
-    
+
     num_a = Counter(left_candidates).most_common(1)[0][0] if left_candidates else ""
     op = Counter(op_candidates).most_common(1)[0][0] if op_candidates else ""
     num_b = Counter(right_candidates).most_common(1)[0][0] if right_candidates else ""
