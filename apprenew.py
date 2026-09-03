@@ -34,6 +34,19 @@ SITE_BASE = "https://openworld.eu.org"
 
 # 续期天数阈值：剩余天数 <= 此值时才执行续期
 RENEW_THRESHOLD_DAYS = 5
+
+# 平台限制：每 24 小时只能续订一次，命中以下文案时跳过本次续期
+COOLDOWN_PATTERNS = [
+    r"每\s*24\s*小时",
+    r"23\s*小时",
+    r"24\s*hours?",
+    r"23\s*hours?",
+    r"once\s+every\s+24",
+    r"only\s+renew",
+    r"renew\s+again",
+    r"try\s+again\s+(?:in|after)",
+    r"请\s*\d+\s*小时",
+]
 # ==========================================
 
 # 截图保存目录（调试用）
@@ -688,6 +701,34 @@ def download_captcha_gif(page) -> bytes:
         return None
 
 
+def check_cooldown(page) -> str:
+    """
+    检测页面/弹窗中是否出现"每24小时只能续订一次"的冷却提示。
+    命中返回匹配到的提示文案（供日志/通知使用），未命中返回空字符串。
+    """
+    try:
+        texts = []
+        body = page.locator("body")
+        if body.count() > 0:
+            texts.append(body.inner_text(timeout=3000))
+        # 弹窗可能不在 body 文本内，再尝试常见的弹窗/提示容器
+        for sel in ["[role='dialog']", ".modal", ".swal2-popup", ".toast", "[class*='modal']"]:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                try:
+                    texts.append(loc.first.inner_text(timeout=2000))
+                except Exception:
+                    pass
+    except Exception:
+        return ""
+    joined = "\n".join(texts)
+    for pat in COOLDOWN_PATTERNS:
+        m = re.search(pat, joined, re.IGNORECASE)
+        if m:
+            return m.group(0)
+    return ""
+
+
 def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     """
     尝试执行验证码续期流程，最多重试 max_attempts 次。
@@ -734,6 +775,12 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到可用的续期按钮")
                 return False
             time.sleep(3)
+
+            # ========== 检查是否处于 24 小时续订冷却期 ==========
+            cooldown_hint = check_cooldown(page)
+            if cooldown_hint:
+                print(f"   ⏳ 平台提示续订冷却期: {cooldown_hint}")
+                return "cooldown"
 
             # ========== 第2步：下载并识别验证码 ==========
             print("   ⏳ 等待验证码图片加载...")
@@ -1029,9 +1076,9 @@ def process_account(browser, account):
             print("🔄 开始执行验证码续期")
             print(f"{'=' * 50}")
 
-            renew_success = try_renew_captcha(page, initial_days=days_left)
+            renew_result = try_renew_captcha(page, initial_days=days_left)
 
-            if renew_success:
+            if renew_result is True:
                 # 计算续期后的到期时间（当前时间 + 6天）
                 expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
                 expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
@@ -1040,6 +1087,13 @@ def process_account(browser, account):
                 print(f"📅 续期至: {expiry_str}")
                 send_telegram_message(msg)
                 stats["renewed"] += 1
+            elif renew_result == "cooldown":
+                # 平台 24 小时冷却期内，非失败，无需重试
+                msg = (f"⏳ Openworld 续订冷却中（每24小时一次）\n账号: {name}\n实例: {target_url}\n"
+                       f"已跳过本次续期，明天自动再试")
+                print(f"⏳ 平台 24 小时续订冷却期，跳过本次续期（非失败）")
+                send_telegram_message(msg)
+                stats["skipped"] += 1
             else:
                 print("❌ 续期失败（5次尝试均未成功）")
                 send_telegram_message(f"❌ Openworld 续期失败：5次验证码尝试均未成功\n账号: {name}\n实例: {target_url}")
