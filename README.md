@@ -36,7 +36,7 @@
 [
   {
     "name": "主号",
-    "token": "MTUwNDcxNDMwNTIzNTMyNTA0MA.GvKlrR.7MlK11uoOIK"
+    "token": "MTUwNDcxNDMwNTI........................."
   },
   {
     "name": "小号A",
