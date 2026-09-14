@@ -173,83 +173,126 @@ def wait_for_cloudflare(page, timeout=15):
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     """
-    通过 Discord Token 完成 OAuth 登录到 openworld.eu.org。
-    
+    适配站点新版 Clerk 认证流程登录到 openworld.eu.org。
+
     流程：
-    1. 访问 /discord-login 触发服务端 302 重定向到 Discord OAuth 页面
-    2. 从重定向后的 URL 中提取 OAuth 参数（client_id, redirect_uri, scope, state）
-    3. 使用 Discord Token 通过 API 直接完成授权
-    4. 用返回的回调 URL 完成登录
+    1. 访问 /login，等待 Clerk JS 加载
+    2. 点击 #clerk-signin 打开 Clerk 登录弹窗
+    3. 在弹窗中点击 Discord 社交登录按钮 → 跳转 Discord OAuth
+    4. 解析 OAuth 参数，用 Discord Token 通过 API 完成授权
+    5. 回调到 Clerk → 页面自动 POST /auth/clerk-callback → 跳转 dashboard
     """
     print("=" * 50)
-    print("🔑 开始 Discord OAuth 登录流程")
+    print("🔑 开始 Clerk + Discord 登录流程")
     print("=" * 50)
 
-    # ========== 第1步：触发 Discord OAuth 重定向 ==========
-    # openworld.eu.org 的登录按钮指向 /discord-login，
-    # 服务端会 302 重定向到 Discord 的 OAuth2 授权页面
-    discord_login_url = f"{SITE_BASE}/discord-login"
-    print(f"\n📌 第1步：访问 Discord 登录入口: {discord_login_url}")
-
+    # ========== 第1步：打开 /login 等待 Clerk 加载 ==========
+    login_url = f"{SITE_BASE}/login"
+    print(f"\n📌 第1步：访问登录页: {login_url}")
     try:
-        # 先访问首页建立基础 cookie/session
-        page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
+        page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(2)
-        print(f"   首页加载完成，当前 URL: {page.url}")
-
-        # 访问 /discord-login，这会触发 302 到 Discord
-        page.goto(discord_login_url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
     except Exception as e:
-        print(f"   ⚠️ 页面加载异常: {e}")
-        # 即使超时也可能已经跳转了，继续检查
+        print(f"   ⚠️ 登录页加载异常: {e}")
+    print(f"   当前 URL: {page.url}")
 
+    # ========== 第2步：点击 Sign in 打开 Clerk 弹窗 ==========
+    print(f"\n📌 第2步：点击 Sign in 按钮打开 Clerk 弹窗")
+    try:
+        signin_btn = page.locator("#clerk-signin").first
+        if not signin_btn.is_visible(timeout=10000):
+            print("   ❌ 未找到 #clerk-signin 按钮，Clerk 可能未加载")
+            save_screenshot(page, "clerk_no_signin_btn")
+            return False
+        # 按钮初始 disabled，等待可用
+        for _ in range(20):
+            if not signin_btn.get_attribute("disabled"):
+                break
+            time.sleep(0.5)
+        signin_btn.click()
+        print("   ✅ 已点击 Sign in")
+        time.sleep(3)
+    except Exception as e:
+        print(f"   ❌ 点击 Sign in 失败: {e}")
+        save_screenshot(page, "clerk_signin_click_fail")
+        return False
+
+    # ========== 第3步：在 Clerk 弹窗中点击 Discord 登录 ==========
+    print(f"\n📌 第3步：在 Clerk 弹窗中查找并点击 Discord 登录按钮")
+
+    # 探测弹窗内所有可点击元素（调试用）
+    try:
+        buttons_info = page.evaluate("""
+            () => {
+                const out = [];
+                document.querySelectorAll('button, a, [role="button"]').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 5 || r.height < 5) return;
+                    out.push({
+                        tag: el.tagName.toLowerCase(),
+                        cls: (el.className || '').toString().slice(0, 100),
+                        text: (el.textContent || '').trim().slice(0, 40),
+                        strategy: el.getAttribute('data-clerk-social-strategy') || '',
+                        x: Math.round(r.x), y: Math.round(r.y),
+                        w: Math.round(r.width), h: Math.round(r.height)
+                    });
+                });
+                return out.slice(0, 40);
+            }
+        """)
+        print(f"   🔎 弹窗可点击元素（共 {len(buttons_info)} 个）:")
+        for b in buttons_info:
+            print(f"      <{b['tag']} class='{b['cls']}' strategy='{b['strategy']}' "
+                  f"({b['x']},{b['y']}) {b['w']}x{b['h']} text='{b['text']}'")
+    except Exception as ex:
+        print(f"   ⚠️ 弹窗探测失败: {ex}")
+        buttons_info = []
+
+    # Discord 按钮候选选择器（Clerk UI 多种可能）
+    discord_selectors = [
+        "[data-clerk-social-strategy='discord']",
+        "button:has-text('Discord')",
+        "a:has-text('Discord')",
+        "[class*='social']:has-text('Discord')",
+        "[class*='discord']",
+        "button[aria-label*='Discord']",
+    ]
+
+    clicked_discord = False
+    for sel in discord_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=2000):
+                print(f"   找到 Discord 按钮 (选择器: {sel})")
+                loc.click()
+                clicked_discord = True
+                break
+        except Exception:
+            continue
+
+    if not clicked_discord:
+        print("   ❌ 未找到 Discord 登录按钮")
+        save_screenshot(page, "clerk_no_discord_btn")
+        return False
+
+    # 等待跳转到 Discord OAuth
+    print("   ⏳ 等待跳转到 Discord OAuth...")
+    for _ in range(15):
+        time.sleep(1)
+        if "discord.com" in page.url:
+            break
     current_url = page.url
     print(f"   跳转后 URL: {current_url}")
-
-    # ========== 第2步：检查是否到达了 Discord 授权页 ==========
-    print(f"\n📌 第2步：检查 Discord OAuth 页面")
-
-    # 如果还在 openworld 的登录页，尝试点击 Discord 按钮
     if "discord.com" not in current_url:
-        print("   未自动跳转到 Discord，尝试在登录页查找 Discord 按钮...")
-        save_screenshot(page, "before_discord_click")
+        print(f"   ❌ 未跳转到 Discord，当前: {current_url}")
+        save_screenshot(page, "clerk_no_discord_redirect")
+        return False
 
-        try:
-            # 查找登录页上的 Discord 登录链接/按钮
-            discord_btn = page.locator("a[href*='discord-login'], a[href*='discord'], a:has-text('Discord')").first
-            if discord_btn.is_visible(timeout=5000):
-                href = discord_btn.get_attribute("href")
-                print(f"   找到 Discord 按钮，href={href}")
-                discord_btn.click()
-                time.sleep(5)
-                current_url = page.url
-                print(f"   点击后 URL: {current_url}")
-        except Exception as e:
-            print(f"   ⚠️ 查找/点击 Discord 按钮失败: {e}")
-
-    # 再次检查
-    if "discord.com" not in current_url:
-        # 最后尝试：有些网站的 /discord-login 可能需要处理 Cloudflare
-        print("   仍未到达 Discord，等待可能的延迟重定向...")
-        for i in range(10):
-            time.sleep(1)
-            current_url = page.url
-            if "discord.com" in current_url:
-                break
-        
-        if "discord.com" not in current_url:
-            print(f"   ❌ 无法跳转到 Discord 授权页面")
-            print(f"   当前 URL: {current_url}")
-            print(f"   页面标题: {page.title()}")
-            save_screenshot(page, "login_failed_no_discord")
-            return False
-
-    # ========== 第3步：从 URL 解析 OAuth 参数 ==========
-    print(f"\n📌 第3步：解析 OAuth 参数")
+    # ========== 第4步：解析 Discord OAuth 参数 ==========
+    print(f"\n📌 第4步：解析 OAuth 参数")
     oauth_url = page.url
-    print(f"   Discord OAuth URL: {oauth_url[:100]}...")
+    print(f"   Discord OAuth URL: {oauth_url[:120]}...")
 
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
@@ -270,10 +313,9 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, "login_failed_parse")
         return False
 
-    # ========== 第4步：通过 API 完成 Discord 授权 ==========
-    print(f"\n📌 第4步：通过 Discord API 完成授权")
+    # ========== 第5步：通过 Discord API 完成授权 ==========
+    print(f"\n📌 第5步：通过 Discord API 完成授权")
 
-    # 构建 API URL
     api_params = urllib.parse.urlencode({
         "client_id":     client_id,
         "response_type": response_type,
@@ -282,16 +324,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         "state":         state,
     })
     authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
-
-    # 构建 referer
-    referer_params = urllib.parse.urlencode({
-        "client_id":     client_id,
-        "redirect_uri":  redirect_uri,
-        "response_type": response_type,
-        "scope":         scope,
-        "state":         state,
-    })
-    referer = f"https://discord.com/oauth2/authorize?{referer_params}"
+    referer = f"https://discord.com/oauth2/authorize?{api_params}"
 
     headers = {
         "accept":           "*/*",
@@ -318,12 +351,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     try:
         resp = requests.post(authorize_api, headers=headers, json=body, timeout=20)
         print(f"   API 响应状态码: {resp.status_code}")
-
         if resp.status_code != 200:
             print(f"   ❌ Discord 授权失败: HTTP {resp.status_code}")
             print(f"   响应内容: {resp.text[:300]}")
             return False
-
         resp_data = resp.json()
     except Exception as e:
         print(f"   ❌ Discord API 请求异常: {e}")
@@ -338,30 +369,32 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     masked_location = re.sub(r"code=[^&]+", "code=***", location)
     print(f"   ✅ 拿到回调 URL: {masked_location}")
 
-    # ========== 第5步：用回调 URL 完成登录 ==========
-    print(f"\n📌 第5步：通过回调 URL 完成登录写入 Cookie")
+    # ========== 第6步：用回调 URL 完成 Clerk 登录 ==========
+    print(f"\n📌 第6步：通过回调 URL 完成 Clerk 登录")
 
     try:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
 
-    time.sleep(5)
+    # Clerk 回调后会自动 POST /auth/clerk-callback 并跳转 dashboard，等待跳转
+    time.sleep(6)
     wait_for_cloudflare(page)
 
     final_url = page.url
     print(f"   回调后 URL: {final_url}")
 
-    # 检查是否登录成功
-    if "/login" in final_url and "discord" not in final_url:
-        print("   ⚠️ 回调后仍在登录页，登录可能失败")
-        save_screenshot(page, "login_callback_stuck")
-        # 有些情况下需要等待更久
-        time.sleep(5)
-        final_url = page.url
-        if "/login" in final_url:
-            print(f"   ❌ 登录最终失败，停留在: {final_url}")
-            return False
+    # 等待离开 /login 到 dashboard（最多 20 秒）
+    for _ in range(20):
+        if "/login" not in page.url and "discord.com" not in page.url:
+            break
+        time.sleep(1)
+    final_url = page.url
+
+    if "/login" in final_url:
+        print(f"   ❌ 登录失败，仍停留在登录页: {final_url}")
+        save_screenshot(page, "clerk_login_stuck")
+        return False
 
     if "openworld.eu.org" in final_url:
         print(f"   ✅ 登录成功！当前 URL: {final_url}")
@@ -370,7 +403,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
     save_screenshot(page, "login_uncertain")
-    # 尝试继续，后续访问 VPS 页面会验证
     return True
 
 
@@ -1381,7 +1413,28 @@ def process_account(browser, account):
         user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
         viewport={"width": 1280, "height": 720},
+        locale="en-US",
+        timezone_id="America/New_York",
     )
+    # 反自动化指纹：覆盖站点 __owFp 检测的 navigator.webdriver / plugins /
+    # languages / window.chrome / cdc 痕迹，使 headless 看起来像真实浏览器
+    context.add_init_script("""
+        () => {
+            try { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); } catch (e) {}
+            try {
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [{name:'PDF Viewer'},{name:'Chrome PDF Viewer'},{name:'Chromium PDF Viewer'}]
+                });
+            } catch (e) {}
+            try {
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            } catch (e) {}
+            if (!window.chrome) { window.chrome = { runtime: {}, app: {}, csi: () => {}, loadTimes: () => {} }; }
+            try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array; } catch (e) {}
+            try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise; } catch (e) {}
+            try { delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol; } catch (e) {}
+        }
+    """)
     page = context.new_page()
 
     stats = {"name": name, "status": "未知", "vps": 0, "renewed": 0, "skipped": 0, "failed": 0}
