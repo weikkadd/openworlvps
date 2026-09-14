@@ -370,6 +370,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             last_log = time.time()
         time.sleep(0.5)
 
+    # 兜底：无论是否超时，只要当前 URL 已是 discord.com 就继续处理
+    # （Cloudflare 挂起时间不稳定，跳转可能刚好在 deadline 之后才发生）
+    if oauth_page is None and "discord.com" in page.url:
+        oauth_page = page
+        print(f"   🔗 deadline 后兜底捕获到 Discord: {page.url}")
+
     # 打印诊断事件
     if console_msgs:
         print(f"   📋 Console 消息（{len(console_msgs)} 条）:")
