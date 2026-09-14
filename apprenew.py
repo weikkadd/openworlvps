@@ -266,6 +266,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     req_failed = []
     req_sent = []
     resp_body = []
+    sign_ins_done = False
 
     def _collect_popup(p):
         popups.append(p)
@@ -286,6 +287,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     def _on_resp(resp):
         if "clerk" in resp.url and ("sign_ins" in resp.url or "authentications" in resp.url
                                      or "start" in resp.url or "oauth" in resp.url):
+            nonlocal sign_ins_done
+            sign_ins_done = True
             try:
                 body = resp.text()[:600]
             except Exception:
@@ -327,12 +330,13 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, "clerk_no_discord_btn")
         return False
 
-    # 等待 Discord OAuth 页面出现（popup 或同页跳转）。sign_ins 被 Cloudflare
-    # 挂起的时间不稳定（15s~60s+），用 deadline 模式最长等 120 秒，0.5s 高频轮询。
-    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转，最长 120 秒）...")
+    # 等待 Discord OAuth 页面出现。sign_ins 被 Cloudflare 挂起的时间不稳定
+    # （15s~120s+），监听 sign_ins response 作为 Clerk 发起跳转的信号。
+    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转，最长 180 秒）...")
     oauth_page = None
-    deadline = time.time() + 120
+    deadline = time.time() + 180
     last_log = time.time()
+    sign_ins_logged = False
     while time.time() < deadline:
         if popups:
             oauth_page = popups[0]
@@ -342,8 +346,27 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             oauth_page = page
             print(f"   🔗 主页面跳转到 Discord")
             break
+        if sign_ins_done and not sign_ins_logged:
+            print(f"   📨 sign_ins 响应已到达，等待 JS 处理跳转...")
+            sign_ins_logged = True
+            # sign_ins 响应后额外等 8s 让 Clerk JS 发起跳转
+            extra_deadline = time.time() + 8
+            while time.time() < extra_deadline:
+                if "discord.com" in page.url:
+                    oauth_page = page
+                    print(f"   🔗 sign_ins 后主页面跳转到 Discord")
+                    break
+                if popups:
+                    oauth_page = popups[0]
+                    print(f"   🪟 sign_ins 后捕获到 OAuth popup")
+                    break
+                time.sleep(0.5)
+            if oauth_page:
+                break
+            # 还没跳转，继续等（可能响应体里是直接跳转指令）
+            print(f"   ⚠️ sign_ins 响应后仍未跳转，继续等待...")
         if time.time() - last_log >= 15:
-            print(f"      ... 已等待 {int(time.time() - (deadline - 120))}s，当前 URL: {page.url}")
+            print(f"      ... 已等待 {int(time.time() - (deadline - 180))}s，当前 URL: {page.url}")
             last_log = time.time()
         time.sleep(0.5)
 
