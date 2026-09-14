@@ -270,7 +270,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # 如果 Clerk JS 失败，直接构造 OAuth URL
     if not oauth_url:
-        # 用 Clerk API 获取 state
+        # 用 Clerk API 获取 state 和 OAuth URL
         try:
             resp = requests.post(
                 "https://clerk.openworld.eu.org/v1/client/sign_ins",
@@ -281,21 +281,49 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             print(f"   Clerk API sign_ins 响应: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
-                # 从响应里提取 OAuth URL
-                if "oauth_url" in data:
-                    oauth_url = data["oauth_url"]
-                elif "external_account" in data:
-                    oauth_url = data.get("external_account", {}).get("oauth_url", "")
-                print(f"   OAuth URL: {oauth_url[:120] if oauth_url else 'N/A'}...")
+                print(f"   sign_ins 响应体: {json.dumps(data, ensure_ascii=False)[:500]}")
+                # 1. 优先提取 external_account.oauth_url
+                ext_acc = data.get("external_account", {})
+                if isinstance(ext_acc, dict):
+                    oauth_url = ext_acc.get("oauth_url", "")
+                if not oauth_url:
+                    # 2. 尝试顶层 oauth_url
+                    oauth_url = data.get("oauth_url", "")
+                # 3. 提取 state（无论是否有 oauth_url 都要取）
+                state = data.get("state", "")
+                if oauth_url:
+                    print(f"   ✅ 从 Clerk API 获取 OAuth URL: {oauth_url[:150]}...")
+                elif state:
+                    print(f"   ✅ 从 Clerk API 获取 state: {state[:30]}...")
         except Exception as e:
             print(f"   ⚠️ Clerk API 调用失败: {e}")
 
-    # 如果还是没拿到 OAuth URL，直接用已知参数构造
+    # 如果还是没拿到 OAuth URL，用 Clerk API 返回的 state 构造
     if not oauth_url:
-        # 生成随机 state
-        import random
-        import string
-        state = ''.join(random.choices(string.ascii_lowercase + string.digits, k=50))
+        if not state:
+            # 备用：用 page 从 Clerk JS 获取 state
+            try:
+                state = page.evaluate("""
+                    async () => {
+                        if (!window.Clerk) return null;
+                        try {
+                            const signIn = await window.Clerk.client.createSignIn({
+                                strategy: 'oauth_discord',
+                                redirectUrl: window.location.href
+                            });
+                            return signIn.state || null;
+                        } catch (e) { return null; }
+                    }
+                """)
+                if state:
+                    print(f"   ✅ 从 Clerk JS 获取 state: {state[:30]}...")
+            except Exception:
+                pass
+        if not state:
+            import random
+            import string
+            state = ''.join(random.choices(string.ascii_lowercase + string.digits, k=50))
+            print(f"   ⚠️ 使用随机 state（Clerk state 未知，可能失败）")
         oauth_url = (
             f"https://discord.com/oauth2/authorize"
             f"?client_id={client_id}"
@@ -303,10 +331,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             f"&response_type={response_type}"
             f"&scope={urllib.parse.quote(scope, safe='')}"
             f"&state={state}"
-            f"&prompt=none"
+            f"&prompt=consent"
             f"&access_type=offline"
         )
-        print(f"   ⚠️ 使用直接构造的 OAuth URL（state 可能不匹配）")
+        print(f"   🔗 OAuth URL: {oauth_url[:150]}...")
 
     # ========== 第3步：用 Discord Token 调 API 完成授权 ==========
     print(f"\n📌 第3步：通过 Discord API 完成授权")
@@ -398,6 +426,14 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     final_url = page.url
     print(f"   回调后 URL: {final_url}")
+
+    # 检查 Clerk 回调错误（err_code=authorization_invalid 等）
+    if "err_code=" in final_url:
+        err_match = re.search(r"err_code=([^&#]+)", final_url)
+        err_code = err_match.group(1) if err_match else "unknown"
+        print(f"   ❌ Clerk 回调错误: {err_code}")
+        save_screenshot(page, f"clerk_callback_err_{err_code}")
+        return False
 
     # 等待离开 /login 到 dashboard
     for _ in range(25):
