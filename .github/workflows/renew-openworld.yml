@@ -43,13 +43,14 @@ jobs:
         run: |
           xvfb-run --auto-servernum python3 apprenew.py
 
-      - name: 💾 上传验证码 GIF
+      - name: 💾 上传验证码 GIF 与调试截图
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: captcha-gifs
           path: |
             *.gif
+            *.png
           if-no-files-found: ignore
           retention-days: 3
 

@@ -729,6 +729,382 @@ def check_cooldown(page) -> str:
     return ""
 
 
+def _human_drag(page, sx, sy, ex, ey, steps=25):
+    """模拟人类拖拽：按下 → 分步带微抖动移动 → 释放"""
+    import random
+    page.mouse.move(sx, sy)
+    time.sleep(0.15)
+    page.mouse.down()
+    time.sleep(0.1)
+    for i in range(1, steps + 1):
+        t = i / steps
+        ease = t * t * (3 - 2 * t)
+        x = sx + (ex - sx) * ease + random.uniform(-1.5, 1.5)
+        y = sy + (ey - sy) * ease + random.uniform(-1.0, 1.0)
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.012, 0.028))
+    page.mouse.move(ex, ey)
+    time.sleep(0.12)
+    page.mouse.up()
+
+
+def _get_stage_info(page):
+    """读取验证阶段文本，返回 (当前阶段, 总阶段) 或 None"""
+    try:
+        text = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        return None
+    patterns = [
+        r"第\s*(\d+)\s*阶段\s*/\s*第\s*(\d+)\s*阶段",
+        r"第\s*(\d+)\s*/\s*第\s*(\d+)\s*阶段",
+        r"(\d+)\s*/\s*(\d+)\s*阶段",
+        r"[Ss]tage\s*(\d+)\s*(?:of|/)\s*(\d+)",
+        r"[Ss]tep\s*(\d+)\s*(?:of|/)\s*(\d+)",
+        r"(\d+)\s*/\s*(\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def _probe_dialog_dom(page):
+    """探测验证弹窗内 DOM 结构，打印关键元素信息（调试用）"""
+    try:
+        info = page.evaluate("""
+            () => {
+                const out = [];
+                const dialog = document.querySelector('[role="dialog"]')
+                    || document.querySelector('.modal')
+                    || document.querySelector('[class*="modal"]')
+                    || document.querySelector('[class*="popup"]')
+                    || document.querySelector('[class*="verify"]');
+                const root = dialog || document.body;
+                const els = root.querySelectorAll('*');
+                for (const el of els) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 5 || r.height < 5) continue;
+                    const tag = el.tagName.toLowerCase();
+                    const cls = (el.className || '').toString().slice(0, 80);
+                    const draggable = el.draggable || el.getAttribute('draggable');
+                    const role = el.getAttribute('role') || '';
+                    const text = (el.textContent || '').trim().slice(0, 30);
+                    out.push({
+                        tag, cls, role,
+                        draggable: !!draggable,
+                        x: Math.round(r.x), y: Math.round(r.y),
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        text
+                    });
+                }
+                return out.slice(0, 80);
+            }
+        """)
+        print(f"   🔎 弹窗 DOM 探测（共 {len(info)} 个元素）:")
+        for e in info:
+            flag = ""
+            if e.get("draggable"):
+                flag = " 👆可拖拽"
+            if e.get("role") in ("slider", "button"):
+                flag += f" [role={e['role']}]"
+            print(f"      <{e['tag']} class='{e['cls']}'{flag}> "
+                  f"({e['x']},{e['y']}) {e['w']}x{e['h']} text='{e['text']}'")
+        return info
+    except Exception as ex:
+        print(f"   ⚠️ DOM 探测失败: {ex}")
+        return []
+
+
+def _boxes_overlap(a, b):
+    return not (a["x"] + a["width"] < b["x"] or b["x"] + b["width"] < a["x"]
+                or a["y"] + a["height"] < b["y"] or b["y"] + b["height"] < a["y"])
+
+
+def _largest_regions(mask, max_count=5, min_pixels=40):
+    """在布尔掩膜上找若干连通区域，返回 box 列表（按面积降序）"""
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    ys, xs = np.where(mask)
+    regions = []
+    for sy, sx in zip(ys.tolist(), xs.tolist()):
+        if visited[sy, sx]:
+            continue
+        stack = [(sy, sx)]
+        pxs, pys = [], []
+        while stack:
+            cy, cx = stack.pop()
+            if visited[cy, cx]:
+                continue
+            visited[cy, cx] = True
+            pxs.append(cx)
+            pys.append(cy)
+            for ny, nx in ((cy + 1, cx), (cy - 1, cx), (cy, cx + 1), (cy, cx - 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
+                    stack.append((ny, nx))
+        if len(pxs) < min_pixels:
+            continue
+        x0, x1 = min(pxs), max(pxs)
+        y0, y1 = min(pys), max(pys)
+        regions.append({
+            "x": float(x0), "y": float(y0),
+            "width": float(x1 - x0 + 1),
+            "height": float(y1 - y0 + 1),
+            "area": len(pxs),
+        })
+    regions.sort(key=lambda r: r["area"], reverse=True)
+    for r in regions:
+        r.pop("area", None)
+    return regions[:max_count]
+
+
+def _locate_by_color(page, target="pink", exclude=None):
+    """截图后按颜色定位区域（降采样加速）。
+    target='pink' 返回单个 box 或 None；target='dark' 返回 box 列表。"""
+    png = page.screenshot()
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    w0, h0 = img.size
+    img = img.resize((w0 // 2, h0 // 2), Image.LANCZOS)
+    arr = np.asarray(img)
+    r, g, b = arr[:, :, 0].astype(int), arr[:, :, 1].astype(int), arr[:, :, 2].astype(int)
+    if target == "pink":
+        mask = (r > 150) & (g < 130) & (b > 120) & (r > b)
+    else:
+        mask = (r < 70) & (g < 70) & (b < 70)
+    if mask.sum() < 50:
+        return None if target == "pink" else []
+    boxes = _largest_regions(mask, max_count=1 if target == "pink" else 6)
+    # 还原到原始坐标
+    for bx in boxes:
+        bx["x"] *= 2
+        bx["y"] *= 2
+        bx["width"] *= 2
+        bx["height"] *= 2
+    if exclude:
+        boxes = [bx for bx in boxes if not _boxes_overlap(bx, exclude)]
+    if not boxes:
+        return None if target == "pink" else []
+    return boxes[0] if target == "pink" else boxes
+
+
+def _find_drag_chip(page):
+    """定位可拖拽芯片，返回 (locator 或 None, box, 策略名)"""
+    selectors = [
+        "[draggable='true']",
+        "[role='slider']",
+        "[class*='chip']",
+        "[class*='handle']",
+        "[class*='slider-btn']",
+        "[class*='puzzle-piece']",
+        "[class*='drag']",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=1500):
+                box = loc.bounding_box()
+                if box and box["width"] > 8 and box["height"] > 8:
+                    print(f"   🎯 芯片定位成功 (选择器: {sel}) "
+                          f"box=({box['x']:.0f},{box['y']:.0f}) {box['width']:.0f}x{box['height']:.0f}")
+                    return loc, box, f"selector:{sel}"
+        except Exception:
+            continue
+    try:
+        chip_box = _locate_by_color(page, target="pink")
+        if chip_box:
+            print(f"   🎯 芯片定位成功 (视觉:粉色) "
+                  f"box=({chip_box['x']:.0f},{chip_box['y']:.0f}) {chip_box['width']:.0f}x{chip_box['height']:.0f}")
+            return None, chip_box, "visual:pink"
+    except Exception as ex:
+        print(f"   ⚠️ 视觉定位芯片失败: {ex}")
+    print("   ❌ 未能定位可拖拽芯片")
+    return None, None, ""
+
+
+def _find_drop_targets(page, chip_box):
+    """定位候选拖放目标，返回 box 列表"""
+    targets = []
+    selectors = [
+        "[class*='slot']",
+        "[class*='target']",
+        "[class*='drop']",
+        "[class*='shape']",
+        "[class*='placeholder']",
+    ]
+    for sel in selectors:
+        try:
+            count = page.locator(sel).count()
+            for i in range(count):
+                loc = page.locator(sel).nth(i)
+                if loc.is_visible(timeout=1000):
+                    box = loc.bounding_box()
+                    if box and box["width"] > 8 and box["height"] > 8:
+                        if chip_box and _boxes_overlap(box, chip_box):
+                            continue
+                        targets.append(box)
+        except Exception:
+            continue
+    if targets:
+        print(f"   🎯 目标定位成功 (选择器) 共 {len(targets)} 个")
+        return targets
+    try:
+        dark_boxes = _locate_by_color(page, target="dark", exclude=chip_box)
+        if dark_boxes:
+            print(f"   🎯 目标定位成功 (视觉:深色) 共 {len(dark_boxes)} 个")
+            return dark_boxes
+    except Exception as ex:
+        print(f"   ⚠️ 视觉定位目标失败: {ex}")
+    return targets
+
+
+def _is_stage_advanced(before, after):
+    if not before or not after:
+        return False
+    return after[0] > before[0]
+
+
+def _chip_gone(page, old_box):
+    """芯片是否已消失或明显移位（表示拖拽生效）"""
+    try:
+        _, chip_box, _ = _find_drag_chip(page)
+        if not chip_box:
+            return True
+        dx = abs(chip_box["x"] - old_box["x"])
+        dy = abs(chip_box["y"] - old_box["y"])
+        return dx > 30 or dy > 30
+    except Exception:
+        return False
+
+
+def _save_debug_shot(page, name):
+    try:
+        png = page.screenshot()
+        path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
+        with open(path, "wb") as f:
+            f.write(png)
+        print(f"   💾 调试截图已保存: {path}")
+    except Exception:
+        pass
+
+
+def solve_drag_captcha(page, max_stages=4) -> bool:
+    """
+    适配新版拖拽拼图验证：将芯片拖到匹配的形状上，共多阶段。
+    返回 True 表示全部阶段完成。
+    """
+    print("   🧩 检测到拖拽拼图验证，开始求解...")
+    _probe_dialog_dom(page)
+
+    for stage in range(1, max_stages + 1):
+        print(f"\n   {'-' * 36}")
+        print(f"   🧩 拖拽验证 第 {stage}/{max_stages} 阶段")
+        print(f"   {'-' * 36}")
+
+        solved = False
+        chip_loc, chip_box, _ = _find_drag_chip(page)
+        if not chip_box:
+            print("   ❌ 无法定位芯片，拖拽验证中止")
+            _save_debug_shot(page, f"drag_no_chip_stage{stage}")
+            return False
+
+        target_boxes = _find_drop_targets(page, chip_box)
+        if not target_boxes:
+            print("   ❌ 无法定位拖放目标，拖拽验证中止")
+            _save_debug_shot(page, f"drag_no_target_stage{stage}")
+            return False
+
+        for tidx, tbox in enumerate(target_boxes):
+            try:
+                if chip_loc is not None:
+                    cb = chip_loc.bounding_box()
+                    if cb:
+                        sx = cb["x"] + cb["width"] / 2
+                        sy = cb["y"] + cb["height"] / 2
+                    else:
+                        sx = chip_box["x"] + chip_box["width"] / 2
+                        sy = chip_box["y"] + chip_box["height"] / 2
+                else:
+                    sx = chip_box["x"] + chip_box["width"] / 2
+                    sy = chip_box["y"] + chip_box["height"] / 2
+                ex = tbox["x"] + tbox["width"] / 2
+                ey = tbox["y"] + tbox["height"] / 2
+                print(f"   🤚 拖拽 → 目标{tidx + 1} ({ex:.0f},{ey:.0f})")
+
+                before_stage = _get_stage_info(page)
+                _human_drag(page, sx, sy, ex, ey)
+                time.sleep(1.5)
+                after_stage = _get_stage_info(page)
+                print(f"   📊 阶段变化: {before_stage} → {after_stage}")
+
+                if _is_stage_advanced(before_stage, after_stage) or _chip_gone(page, chip_box):
+                    print(f"   ✅ 第 {stage} 阶段完成")
+                    solved = True
+                    break
+                else:
+                    print(f"   ⚠️ 目标{tidx + 1} 未推进阶段，尝试下一个目标")
+                    time.sleep(0.8)
+            except Exception as ex_drag:
+                print(f"   ⚠️ 拖拽异常: {ex_drag}")
+                continue
+
+        if not solved:
+            print(f"   ❌ 第 {stage} 阶段所有目标均未成功")
+            _save_debug_shot(page, f"drag_fail_stage{stage}")
+            try:
+                refresh = page.locator(
+                    "button:has-text('刷新'), [class*='refresh'], button[aria-label*='refresh']"
+                ).first
+                if refresh.is_visible(timeout=1500):
+                    refresh.click()
+                    time.sleep(1.5)
+                    print("   🔄 已刷新验证，重试本阶段")
+                    chip_loc, chip_box, _ = _find_drag_chip(page)
+                    target_boxes = _find_drop_targets(page, chip_box)
+                    if chip_box and target_boxes:
+                        for tbox in target_boxes:
+                            sx = chip_box["x"] + chip_box["width"] / 2
+                            sy = chip_box["y"] + chip_box["height"] / 2
+                            _human_drag(page, sx, sy,
+                                        tbox["x"] + tbox["width"] / 2,
+                                        tbox["y"] + tbox["height"] / 2)
+                            time.sleep(1.5)
+                            if _chip_gone(page, chip_box):
+                                solved = True
+                                break
+            except Exception:
+                pass
+            if not solved:
+                return False
+
+    print("   ✅ 拖拽拼图全部阶段完成")
+    return True
+
+
+def _detect_captcha_type(page):
+    """检测当前弹窗验证类型：'drag' / 'gif' / 'unknown'"""
+    try:
+        text = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        text = ""
+    drag_hints = ["将芯片拖到匹配的形状", "拖到匹配", "芯片", "匹配的形状", "拖动", "drag"]
+    low = text.lower()
+    for h in drag_hints:
+        if h in text or h.lower() in low:
+            return "drag"
+    for sel in ["img[alt*='captcha']", "img[alt*='Captcha']", "img[src*='captcha']", ".captcha img"]:
+        try:
+            if page.locator(sel).first.is_visible(timeout=1000):
+                return "gif"
+        except Exception:
+            continue
+    try:
+        if page.locator("[draggable='true'], [role='slider']").first.is_visible(timeout=1000):
+            return "drag"
+    except Exception:
+        pass
+    return "unknown"
+
+
 def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
     """
     尝试执行验证码续期流程，最多重试 max_attempts 次。
@@ -755,8 +1131,11 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             renew_selectors = [
                 "button:has-text('Renew free')",
                 "button:has-text('Renew')",
+                "button:has-text('免费续订')",
+                "button:has-text('续订')",
                 "a:has-text('Renew free')",
                 "a:has-text('Renew')",
+                "a:has-text('免费续订')",
                 "[class*='renew']",
             ]
             clicked = False
@@ -782,65 +1161,88 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print(f"   ⏳ 平台提示续订冷却期: {cooldown_hint}")
                 return "cooldown"
 
-            # ========== 第2步：下载并识别验证码 ==========
-            print("   ⏳ 等待验证码图片加载...")
+            # ========== 第2步：识别验证类型并求解 ==========
             time.sleep(1)
+            captcha_type = _detect_captcha_type(page)
+            print(f"   🔍 验证类型: {captcha_type}")
 
-            gif_bytes = download_captcha_gif(page)
-            if not gif_bytes:
-                print("   ⚠️ 未获取到验证码图片")
-                continue
+            proceed_to_submit = False
 
-            # 保存原始 GIF（调试用）
-            gif_path = os.path.join(SCREENSHOT_DIR, f"captcha_raw_{attempt}.gif")
-            try:
-                with open(gif_path, "wb") as f:
-                    f.write(gif_bytes)
-                print(f"   💾 原始验证码已保存: {gif_path}")
-            except Exception:
-                pass
-
-            # 分解帧识别算式并求解
-            answer = recognize_captcha_by_frames(gif_bytes, ocr)
-            if not answer:
-                print("   ⚠️ 验证码识别求解失败，刷新重试...")
-                # 刷新页面恢复干净状态
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-                continue
-
-            print(f"   📝 最终计算答案: {answer}")
-
-            # ========== 第3步：填入并提交 ==========
-            input_selectors = [
-                "input[placeholder='Answer']",
-                "input[placeholder='answer']",
-                "input[name='captcha']",
-                "input[name='answer']",
-                "input[type='text']",
-            ]
-
-            input_filled = False
-            for selector in input_selectors:
-                try:
-                    inp = page.locator(selector).first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill("")  # 先清空
-                        inp.fill(answer)
-                        input_filled = True
-                        print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
-                        break
-                except Exception:
+            # ----- 拖拽拼图验证 -----
+            if captcha_type in ("drag", "unknown"):
+                drag_ok = solve_drag_captcha(page)
+                if drag_ok:
+                    proceed_to_submit = True
+                elif captcha_type == "unknown":
+                    captcha_type = "gif"
+                    print("   🔄 拖拽未成功且类型未定，回退尝试 GIF 算式验证码")
+                else:
+                    print("   ⚠️ 拖拽验证未通过，刷新重试...")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
                     continue
 
-            if not input_filled:
-                print("   ❌ 未找到验证码输入框")
+            # ----- GIF 算式验证码 -----
+            if captcha_type == "gif" and not proceed_to_submit:
+                print("   ⏳ 等待验证码图片加载...")
+                gif_bytes = download_captcha_gif(page)
+                if not gif_bytes:
+                    print("   ⚠️ 未获取到验证码图片")
+                    continue
+
+                gif_path = os.path.join(SCREENSHOT_DIR, f"captcha_raw_{attempt}.gif")
+                try:
+                    with open(gif_path, "wb") as f:
+                        f.write(gif_bytes)
+                    print(f"   💾 原始验证码已保存: {gif_path}")
+                except Exception:
+                    pass
+
+                answer = recognize_captcha_by_frames(gif_bytes, ocr)
+                if not answer:
+                    print("   ⚠️ 验证码识别求解失败，刷新重试...")
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    continue
+
+                print(f"   📝 最终计算答案: {answer}")
+
+                input_selectors = [
+                    "input[placeholder='Answer']",
+                    "input[placeholder='answer']",
+                    "input[name='captcha']",
+                    "input[name='answer']",
+                    "input[type='text']",
+                ]
+                input_filled = False
+                for selector in input_selectors:
+                    try:
+                        inp = page.locator(selector).first
+                        if inp.is_visible(timeout=3000):
+                            inp.fill("")
+                            inp.fill(answer)
+                            input_filled = True
+                            print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
+                            break
+                    except Exception:
+                        continue
+
+                if not input_filled:
+                    print("   ❌ 未找到验证码输入框")
+                    continue
+                proceed_to_submit = True
+
+            if not proceed_to_submit:
                 continue
 
-            # 提交
+            # ========== 第3步：提交 ==========
             confirm_selectors = [
+                "button:has-text('确认续订')",
+                "button:has-text('确认')",
                 "button:has-text('Confirm Renewal')",
                 "button:has-text('Confirm')",
                 "button:has-text('Submit')",
