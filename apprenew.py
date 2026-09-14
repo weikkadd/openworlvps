@@ -327,12 +327,13 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, "clerk_no_discord_btn")
         return False
 
-    # 等待 Discord OAuth 页面出现（popup 或同页跳转）。sign_ins 可能被
-    # Cloudflare 挂起 15 秒以上才响应，等待放宽到 45 秒。
-    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转）...")
+    # 等待 Discord OAuth 页面出现（popup 或同页跳转）。sign_ins 被 Cloudflare
+    # 挂起的时间不稳定（15s~60s+），用 deadline 模式最长等 120 秒，0.5s 高频轮询。
+    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转，最长 120 秒）...")
     oauth_page = None
-    for _ in range(45):
-        time.sleep(1)
+    deadline = time.time() + 120
+    last_log = time.time()
+    while time.time() < deadline:
         if popups:
             oauth_page = popups[0]
             print(f"   🪟 捕获到 OAuth popup")
@@ -341,6 +342,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             oauth_page = page
             print(f"   🔗 主页面跳转到 Discord")
             break
+        if time.time() - last_log >= 15:
+            print(f"      ... 已等待 {int(time.time() - (deadline - 120))}s，当前 URL: {page.url}")
+            last_log = time.time()
+        time.sleep(0.5)
 
     # 打印诊断事件
     if console_msgs:
