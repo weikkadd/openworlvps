@@ -1633,6 +1633,12 @@ def main():
     for acc in accounts:
         print(f"   - {acc['name']}: {mask_token(acc['token'])}")
 
+    # ACCOUNT_LIMIT 限制处理的账号数量（调试时只跑第一个账号）
+    account_limit = int(os.environ.get("ACCOUNT_LIMIT", "0") or "0")
+    if account_limit > 0 and account_limit < len(accounts):
+        accounts = accounts[:account_limit]
+        print(f"🔢 ACCOUNT_LIMIT={account_limit}，仅处理前 {len(accounts)} 个账号")
+
     headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
     print(f"🖥️  运行模式: {'无头' if headless_mode else '有头'}")
     print("🎯 每个账号登录后将自动从面板检测 VPS 实例并逐一续期")
