@@ -363,6 +363,28 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         for r in resp_body[-6:]:
             print(f"      {r}")
 
+    # 探测是否出现人机验证/挑战元素（Turnstile/captcha/hcaptcha/challenge）
+    try:
+        challenge_info = page.evaluate("""
+            () => {
+                const out = [];
+                document.querySelectorAll('iframe, [class*="captcha"], [class*="turnstile"], '
+                    + '[class*="hcaptcha"], [id*="captcha"], [class*="challenge"], [class*="verify"]').forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 10 && r.height < 10) return;
+                    out.push(el.tagName + ' class=' + (el.className || '').toString().slice(0, 60)
+                        + ' src=' + (el.src || '').slice(0, 80));
+                });
+                return out;
+            }
+        """)
+        if challenge_info:
+            print(f"   🛡️ 检测到挑战/验证元素（{len(challenge_info)} 个）:")
+            for c in challenge_info:
+                print(f"      {c}")
+    except Exception:
+        pass
+
     page.context.remove_listener("page", _collect_popup)
     page.remove_listener("console", _on_console)
     page.remove_listener("pageerror", _on_pageerr)
