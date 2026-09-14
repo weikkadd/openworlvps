@@ -1542,7 +1542,7 @@ def process_account(browser, account):
 
         if not success:
             print(f"\n❌ [{name}] 登录流程失败，跳过该账号。")
-            send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 登录流程失败")
+
             stats["status"] = "登录失败"
             return stats
 
@@ -1554,7 +1554,7 @@ def process_account(browser, account):
             print(f"\n❌ [{name}] 未能从面板自动检测到任何 VPS 实例。")
             print("💡 请检查账号是否有活跃的 VPS 实例")
             save_screenshot(page, "no_vps_found")
-            send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 未在面板找到任何 VPS 实例")
+
             stats["status"] = "无VPS实例"
             return stats
 
@@ -1581,7 +1581,7 @@ def process_account(browser, account):
             if "/login" in current_url:
                 print("❌ 被重定向到登录页，Cookie 可能无效")
                 save_screenshot(page, f"redirect_to_login_{name}_{idx}")
-                send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 登录后仍被重定向到登录页")
+
                 stats["failed"] += 1
                 break
 
@@ -1592,7 +1592,7 @@ def process_account(browser, account):
                 print(f"❌ [{name}] 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
                 print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
                 save_screenshot(page, f"vps_404_{name}_{idx}")
-                send_telegram_message(f"❌ Openworld 续期失败：账号 {name} 页面 404 Not Found\nURL: {target_url}")
+
                 stats["failed"] += 1
                 continue
 
@@ -1613,7 +1613,7 @@ def process_account(browser, account):
                 if days_left > RENEW_THRESHOLD_DAYS:
                     msg = f"⏳ 剩余 {days_left} 天 > {RENEW_THRESHOLD_DAYS} 天阈值，跳过续期"
                     print(msg)
-                    send_telegram_message(f"ℹ️ Openworld 无需续期\n账号: {name}\n实例: {target_url}\n剩余时间: {days_left} 天")
+
                     stats["skipped"] += 1
                     continue
                 else:
@@ -1634,21 +1634,16 @@ def process_account(browser, account):
                 # 计算续期后的到期时间（当前时间 + 6天）
                 expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
                 expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                msg = f"✅ Openworld 续期成功！\n账号: {name}\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
                 print(f"✅ 续期成功！天数已更新为 6 天")
                 print(f"📅 续期至: {expiry_str}")
-                send_telegram_message(msg)
                 stats["renewed"] += 1
             elif renew_result == "cooldown":
                 # 平台 24 小时冷却期内，非失败，无需重试
-                msg = (f"⏳ Openworld 续订冷却中（每24小时一次）\n账号: {name}\n实例: {target_url}\n"
-                       f"已跳过本次续期，明天自动再试")
                 print(f"⏳ 平台 24 小时续订冷却期，跳过本次续期（非失败）")
-                send_telegram_message(msg)
                 stats["skipped"] += 1
             else:
                 print("❌ 续期失败（5次尝试均未成功）")
-                send_telegram_message(f"❌ Openworld 续期失败：5次验证码尝试均未成功\n账号: {name}\n实例: {target_url}")
+
                 stats["failed"] += 1
 
         stats["status"] = "完成"
@@ -1659,7 +1654,7 @@ def process_account(browser, account):
         import traceback
         traceback.print_exc()
         save_screenshot(page, f"uncaught_error_{name}")
-        send_telegram_message(f"❌ Openworld 续期脚本异常（账号 {name}）: {str(e)[:200]}")
+
         stats["status"] = f"异常: {str(e)[:50]}"
         return stats
 
@@ -1735,8 +1730,8 @@ def main():
     print(f"\n🏁 全部执行完毕: {len(results)} 个账号, 共 {total_vps} 台 VPS, "
           f"成功续期 {total_renewed} 台, 失败 {total_failed} 台")
 
-    if len(results) > 1:
-        summary_msg = "📊 Openworld 多账号续期汇总\n" + "\n".join(summary_lines)
+    if results:
+        summary_msg = "📊 Openworld 续期汇总\n" + "\n".join(summary_lines)
         send_telegram_message(summary_msg)
 
     # 有失败项时以非零退出码结束，便于在 GitHub Actions 中标记失败
