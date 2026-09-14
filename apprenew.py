@@ -261,11 +261,32 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # 监听 popup（Clerk 社交登录会在新窗口打开 Discord OAuth）
     popups = []
+    console_msgs = []
+    page_errors = []
+    req_failed = []
+    req_sent = []
 
     def _collect_popup(p):
         popups.append(p)
 
+    def _on_console(msg):
+        console_msgs.append(f"[{msg.type}] {msg.text}")
+
+    def _on_pageerr(err):
+        page_errors.append(str(err))
+
+    def _on_req_failed(req):
+        req_failed.append(f"{req.method} {req.url[:120]} -> {req.failure}")
+
+    def _on_req(req):
+        if "clerk" in req.url or "discord" in req.url or "oauth" in req.url:
+            req_sent.append(f"{req.method} {req.url[:140]}")
+
     page.context.on("page", _collect_popup)
+    page.on("console", _on_console)
+    page.on("pageerror", _on_pageerr)
+    page.on("requestfailed", _on_req_failed)
+    page.on("request", _on_req)
 
     clicked_discord = False
     for sel in discord_selectors:
@@ -273,7 +294,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             loc = page.locator(sel).first
             if loc.is_visible(timeout=2000):
                 print(f"   找到 Discord 按钮 (选择器: {sel})")
-                loc.click()
+                # 先尝试常规 click，失败则 force click，再失败则 JS dispatchEvent
+                try:
+                    loc.click(timeout=5000)
+                except Exception:
+                    print("   ⚠️ 常规 click 失败，尝试 force click...")
+                    loc.click(force=True, timeout=5000)
                 clicked_discord = True
                 break
         except Exception:
@@ -281,6 +307,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     if not clicked_discord:
         page.context.remove_listener("page", _collect_popup)
+        page.remove_listener("console", _on_console)
+        page.remove_listener("pageerror", _on_pageerr)
+        page.remove_listener("requestfailed", _on_req_failed)
+        page.remove_listener("request", _on_req)
         print("   ❌ 未找到 Discord 登录按钮")
         save_screenshot(page, "clerk_no_discord_btn")
         return False
@@ -299,7 +329,29 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             print(f"   🔗 主页面跳转到 Discord")
             break
 
+    # 打印诊断事件
+    if console_msgs:
+        print(f"   📋 Console 消息（{len(console_msgs)} 条）:")
+        for m in console_msgs[-15:]:
+            print(f"      {m}")
+    if page_errors:
+        print(f"   💥 页面 JS 错误（{len(page_errors)} 条）:")
+        for e in page_errors[-10:]:
+            print(f"      {e}")
+    if req_sent:
+        print(f"   🌐 Clerk/Discord 相关请求（{len(req_sent)} 条）:")
+        for r in req_sent[-15:]:
+            print(f"      {r}")
+    if req_failed:
+        print(f"   ❌ 失败请求（{len(req_failed)} 条）:")
+        for r in req_failed[-10:]:
+            print(f"      {r}")
+
     page.context.remove_listener("page", _collect_popup)
+    page.remove_listener("console", _on_console)
+    page.remove_listener("pageerror", _on_pageerr)
+    page.remove_listener("requestfailed", _on_req_failed)
+    page.remove_listener("request", _on_req)
 
     if oauth_page is None:
         print(f"   ❌ 未跳转到 Discord，当前: {page.url}")
