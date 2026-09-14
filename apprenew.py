@@ -265,6 +265,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     page_errors = []
     req_failed = []
     req_sent = []
+    resp_body = []
 
     def _collect_popup(p):
         popups.append(p)
@@ -282,11 +283,21 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         if "clerk" in req.url or "discord" in req.url or "oauth" in req.url:
             req_sent.append(f"{req.method} {req.url[:140]}")
 
+    def _on_resp(resp):
+        if "clerk" in resp.url and ("sign_ins" in resp.url or "authentications" in resp.url
+                                     or "start" in resp.url or "oauth" in resp.url):
+            try:
+                body = resp.text()[:600]
+            except Exception:
+                body = "<无法读取响应体>"
+            resp_body.append(f"[{resp.status}] {resp.url[:100]}\n      {body}")
+
     page.context.on("page", _collect_popup)
     page.on("console", _on_console)
     page.on("pageerror", _on_pageerr)
     page.on("requestfailed", _on_req_failed)
     page.on("request", _on_req)
+    page.on("response", _on_resp)
 
     clicked_discord = False
     for sel in discord_selectors:
@@ -311,6 +322,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         page.remove_listener("pageerror", _on_pageerr)
         page.remove_listener("requestfailed", _on_req_failed)
         page.remove_listener("request", _on_req)
+        page.remove_listener("response", _on_resp)
         print("   ❌ 未找到 Discord 登录按钮")
         save_screenshot(page, "clerk_no_discord_btn")
         return False
@@ -346,12 +358,17 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         print(f"   ❌ 失败请求（{len(req_failed)} 条）:")
         for r in req_failed[-10:]:
             print(f"      {r}")
+    if resp_body:
+        print(f"   📦 Clerk 响应体（{len(resp_body)} 条）:")
+        for r in resp_body[-6:]:
+            print(f"      {r}")
 
     page.context.remove_listener("page", _collect_popup)
     page.remove_listener("console", _on_console)
     page.remove_listener("pageerror", _on_pageerr)
     page.remove_listener("requestfailed", _on_req_failed)
     page.remove_listener("request", _on_req)
+    page.remove_listener("response", _on_resp)
 
     if oauth_page is None:
         print(f"   ❌ 未跳转到 Discord，当前: {page.url}")
