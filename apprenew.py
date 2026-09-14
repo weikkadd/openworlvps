@@ -173,22 +173,21 @@ def wait_for_cloudflare(page, timeout=15):
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     """
-    适配站点新版 Clerk 认证流程登录到 openworld.eu.org。
+    绕过 Clerk JS 流程，直接用 Discord Token 完成 OAuth 授权登录。
 
     流程：
-    1. 访问 /login，等待 Clerk JS 加载
-    2. 点击 #clerk-signin 打开 Clerk 登录弹窗
-    3. 在弹窗中点击 Discord 社交登录按钮 → 跳转 Discord OAuth
-    4. 解析 OAuth 参数，用 Discord Token 通过 API 完成授权
-    5. 回调到 Clerk → 页面自动 POST /auth/clerk-callback → 跳转 dashboard
+    1. 访问 /login 获取 CSRF token（从 cookie）
+    2. 用已知 OAuth 参数构造 Discord OAuth URL
+    3. 用 Discord Token 调 /api/v9/oauth2/authorize 拿 location
+    4. goto Clerk oauth_callback 完成登录
     """
     print("=" * 50)
-    print("🔑 开始 Clerk + Discord 登录流程")
+    print("🔑 开始 Discord OAuth 直连登录（绕过 Clerk）")
     print("=" * 50)
 
-    # ========== 第1步：打开 /login 等待 Clerk 加载 ==========
+    # ========== 第1步：访问 /login 建立 session 和 CSRF token ==========
     login_url = f"{SITE_BASE}/login"
-    print(f"\n📌 第1步：访问登录页: {login_url}")
+    print(f"\n📌 第1步：访问登录页建立 session: {login_url}")
     try:
         page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
@@ -197,270 +196,124 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         print(f"   ⚠️ 登录页加载异常: {e}")
     print(f"   当前 URL: {page.url}")
 
-    # ========== 第2步：点击 Sign in 打开 Clerk 弹窗 ==========
-    print(f"\n📌 第2步：点击 Sign in 按钮打开 Clerk 弹窗")
+    # 获取 CSRF token
+    csrf_token = ""
     try:
-        signin_btn = page.locator("#clerk-signin").first
-        if not signin_btn.is_visible(timeout=10000):
-            print("   ❌ 未找到 #clerk-signin 按钮，Clerk 可能未加载")
-            save_screenshot(page, "clerk_no_signin_btn")
-            return False
-        # 按钮初始 disabled，等待可用
-        for _ in range(20):
-            if not signin_btn.get_attribute("disabled"):
+        cookies = page.context.cookies()
+        for c in cookies:
+            if c["name"] == "csrf_token":
+                csrf_token = c["value"]
                 break
-            time.sleep(0.5)
-        signin_btn.click()
-        print("   ✅ 已点击 Sign in")
-        time.sleep(3)
-    except Exception as e:
-        print(f"   ❌ 点击 Sign in 失败: {e}")
-        save_screenshot(page, "clerk_signin_click_fail")
-        return False
+    except Exception:
+        pass
+    print(f"   CSRF token: {'已获取' if csrf_token else '未找到'}")
 
-    # ========== 第3步：在 Clerk 弹窗中点击 Discord 登录 ==========
-    print(f"\n📌 第3步：在 Clerk 弹窗中查找并点击 Discord 登录按钮")
+    # ========== 第2步：用 Clerk API 创建 sign-in 尝试获取 OAuth 参数 ==========
+    print(f"\n📌 第2步：通过 Clerk API 创建 sign-in 尝试")
 
-    # 探测弹窗内所有可点击元素（调试用）
+    # Clerk 的 Discord OAuth 应用信息（从之前的跳转中提取）
+    client_id = "1525633239555772426"
+    redirect_uri = "https://clerk.openworld.eu.org/v1/oauth_callback"
+    scope = "identify email"
+    response_type = "code"
+
+    # 先尝试 Clerk API 获取 state（POST /v1/client/sign_ins）
+    state = ""
     try:
-        buttons_info = page.evaluate("""
-            () => {
-                const out = [];
-                document.querySelectorAll('button, a, [role="button"]').forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 5 || r.height < 5) return;
-                    out.push({
-                        tag: el.tagName.toLowerCase(),
-                        cls: (el.className || '').toString().slice(0, 100),
-                        text: (el.textContent || '').trim().slice(0, 40),
-                        strategy: el.getAttribute('data-clerk-social-strategy') || '',
-                        x: Math.round(r.x), y: Math.round(r.y),
-                        w: Math.round(r.width), h: Math.round(r.height)
-                    });
-                });
-                return out.slice(0, 40);
-            }
+        resp = page.evaluate(f"""
+            async () => {{
+                try {{
+                    const r = await fetch('/login', {{ method: 'GET', credentials: 'include' }});
+                    const text = await r.text();
+                    // 从 Clerk JS 初始化脚本中提取 publishable key
+                    const match = text.match(/data-clerk-publishable-key="([^"]+)"/);
+                    return match ? match[1] : null;
+                }} catch (e) {{
+                    return null;
+                }}
+            }}
         """)
-        print(f"   🔎 弹窗可点击元素（共 {len(buttons_info)} 个）:")
-        for b in buttons_info:
-            print(f"      <{b['tag']} class='{b['cls']}' strategy='{b['strategy']}' "
-                  f"({b['x']},{b['y']}) {b['w']}x{b['h']} text='{b['text']}'")
-    except Exception as ex:
-        print(f"   ⚠️ 弹窗探测失败: {ex}")
-        buttons_info = []
-
-    # Discord 按钮候选选择器（Clerk UI 多种可能）
-    discord_selectors = [
-        "[data-clerk-social-strategy='discord']",
-        "button:has-text('Discord')",
-        "a:has-text('Discord')",
-        "[class*='social']:has-text('Discord')",
-        "[class*='discord']",
-        "button[aria-label*='Discord']",
-    ]
-
-    # 监听 popup（Clerk 社交登录会在新窗口打开 Discord OAuth）
-    popups = []
-    console_msgs = []
-    page_errors = []
-    req_failed = []
-    req_sent = []
-    resp_body = []
-    sign_ins_done = False
-
-    def _collect_popup(p):
-        popups.append(p)
-
-    def _on_console(msg):
-        console_msgs.append(f"[{msg.type}] {msg.text}")
-
-    def _on_pageerr(err):
-        page_errors.append(str(err))
-
-    def _on_req_failed(req):
-        req_failed.append(f"{req.method} {req.url[:120]} -> {req.failure}")
-
-    def _on_req(req):
-        if "clerk" in req.url or "discord" in req.url or "oauth" in req.url:
-            req_sent.append(f"{req.method} {req.url[:140]}")
-
-    def _on_resp(resp):
-        if "clerk" in resp.url and ("sign_ins" in resp.url or "authentications" in resp.url
-                                     or "start" in resp.url or "oauth" in resp.url):
-            nonlocal sign_ins_done
-            sign_ins_done = True
-            try:
-                body = resp.text()[:600]
-            except Exception:
-                body = "<无法读取响应体>"
-            resp_body.append(f"[{resp.status}] {resp.url[:100]}\n      {body}")
-
-    page.context.on("page", _collect_popup)
-    page.on("console", _on_console)
-    page.on("pageerror", _on_pageerr)
-    page.on("requestfailed", _on_req_failed)
-    page.on("request", _on_req)
-    page.on("response", _on_resp)
-
-    clicked_discord = False
-    for sel in discord_selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=2000):
-                print(f"   找到 Discord 按钮 (选择器: {sel})")
-                # 先尝试常规 click，失败则 force click，再失败则 JS dispatchEvent
-                try:
-                    loc.click(timeout=5000)
-                except Exception:
-                    print("   ⚠️ 常规 click 失败，尝试 force click...")
-                    loc.click(force=True, timeout=5000)
-                clicked_discord = True
-                break
-        except Exception:
-            continue
-
-    if not clicked_discord:
-        page.context.remove_listener("page", _collect_popup)
-        page.remove_listener("console", _on_console)
-        page.remove_listener("pageerror", _on_pageerr)
-        page.remove_listener("requestfailed", _on_req_failed)
-        page.remove_listener("request", _on_req)
-        page.remove_listener("response", _on_resp)
-        print("   ❌ 未找到 Discord 登录按钮")
-        save_screenshot(page, "clerk_no_discord_btn")
-        return False
-
-    # 等待 Discord OAuth 页面出现。sign_ins 被 Cloudflare 挂起的时间不稳定
-    # （15s~120s+），监听 sign_ins response 作为 Clerk 发起跳转的信号。
-    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转，最长 180 秒）...")
-    oauth_page = None
-    deadline = time.time() + 180
-    last_log = time.time()
-    sign_ins_logged = False
-    while time.time() < deadline:
-        if popups:
-            oauth_page = popups[0]
-            print(f"   🪟 捕获到 OAuth popup")
-            break
-        if "discord.com" in page.url:
-            oauth_page = page
-            print(f"   🔗 主页面跳转到 Discord")
-            break
-        if sign_ins_done and not sign_ins_logged:
-            print(f"   📨 sign_ins 响应已到达，等待 JS 处理跳转...")
-            sign_ins_logged = True
-            # sign_ins 响应后额外等 8s 让 Clerk JS 发起跳转
-            extra_deadline = time.time() + 8
-            while time.time() < extra_deadline:
-                if "discord.com" in page.url:
-                    oauth_page = page
-                    print(f"   🔗 sign_ins 后主页面跳转到 Discord")
-                    break
-                if popups:
-                    oauth_page = popups[0]
-                    print(f"   🪟 sign_ins 后捕获到 OAuth popup")
-                    break
-                time.sleep(0.5)
-            if oauth_page:
-                break
-            # 还没跳转，继续等（可能响应体里是直接跳转指令）
-            print(f"   ⚠️ sign_ins 响应后仍未跳转，继续等待...")
-        if time.time() - last_log >= 15:
-            print(f"      ... 已等待 {int(time.time() - (deadline - 180))}s，当前 URL: {page.url}")
-            last_log = time.time()
-        time.sleep(0.5)
-
-    # 兜底：无论是否超时，只要当前 URL 已是 discord.com 就继续处理
-    # （Cloudflare 挂起时间不稳定，跳转可能刚好在 deadline 之后才发生）
-    if oauth_page is None and "discord.com" in page.url:
-        oauth_page = page
-        print(f"   🔗 deadline 后兜底捕获到 Discord: {page.url}")
-
-    # 打印诊断事件
-    if console_msgs:
-        print(f"   📋 Console 消息（{len(console_msgs)} 条）:")
-        for m in console_msgs[-15:]:
-            print(f"      {m}")
-    if page_errors:
-        print(f"   💥 页面 JS 错误（{len(page_errors)} 条）:")
-        for e in page_errors[-10:]:
-            print(f"      {e}")
-    if req_sent:
-        print(f"   🌐 Clerk/Discord 相关请求（{len(req_sent)} 条）:")
-        for r in req_sent[-15:]:
-            print(f"      {r}")
-    if req_failed:
-        print(f"   ❌ 失败请求（{len(req_failed)} 条）:")
-        for r in req_failed[-10:]:
-            print(f"      {r}")
-    if resp_body:
-        print(f"   📦 Clerk 响应体（{len(resp_body)} 条）:")
-        for r in resp_body[-6:]:
-            print(f"      {r}")
-
-    # 探测是否出现人机验证/挑战元素（Turnstile/captcha/hcaptcha/challenge）
-    try:
-        challenge_info = page.evaluate("""
-            () => {
-                const out = [];
-                document.querySelectorAll('iframe, [class*="captcha"], [class*="turnstile"], '
-                    + '[class*="hcaptcha"], [id*="captcha"], [class*="challenge"], [class*="verify"]').forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 10 && r.height < 10) return;
-                    out.push(el.tagName + ' class=' + (el.className || '').toString().slice(0, 60)
-                        + ' src=' + (el.src || '').slice(0, 80));
-                });
-                return out;
-            }
-        """)
-        if challenge_info:
-            print(f"   🛡️ 检测到挑战/验证元素（{len(challenge_info)} 个）:")
-            for c in challenge_info:
-                print(f"      {c}")
+        if resp:
+            print(f"   Clerk publishable key: {resp[:40]}...")
     except Exception:
         pass
 
-    page.context.remove_listener("page", _collect_popup)
-    page.remove_listener("console", _on_console)
-    page.remove_listener("pageerror", _on_pageerr)
-    page.remove_listener("requestfailed", _on_req_failed)
-    page.remove_listener("request", _on_req)
-    page.remove_listener("response", _on_resp)
+    # 尝试从 Clerk JS 获取 OAuth URL
+    oauth_url = ""
+    try:
+        # 等待 Clerk JS 加载
+        time.sleep(2)
+        oauth_url = page.evaluate("""
+            async () => {
+                if (!window.Clerk) return null;
+                try {
+                    // 创建 sign-in 尝试并获取 OAuth URL
+                    const signIn = await window.Clerk.client.createSignIn({
+                        strategy: 'oauth_discord',
+                        redirectUrl: window.location.href
+                    });
+                    const url = await signIn.authenticateWithRedirect({
+                        redirectUrl: window.location.href,
+                        baseUrl: window.location.origin
+                    });
+                    return url || null;
+                } catch (e) {
+                    return null;
+                }
+            }
+        """)
+        if oauth_url:
+            print(f"   ✅ 从 Clerk JS 获取 OAuth URL: {oauth_url[:120]}...")
+    except Exception as e:
+        print(f"   ⚠️ Clerk JS 获取 OAuth URL 失败: {e}")
+        oauth_url = ""
 
-    if oauth_page is None:
-        print(f"   ❌ 未跳转到 Discord，当前: {page.url}")
-        save_screenshot(page, "clerk_no_discord_redirect")
-        return False
+    # 如果 Clerk JS 失败，直接构造 OAuth URL
+    if not oauth_url:
+        # 用 Clerk API 获取 state
+        try:
+            resp = requests.post(
+                "https://clerk.openworld.eu.org/v1/client/sign_ins",
+                json={"strategy": "oauth_discord", "redirect_url": "https://openworld.eu.org/"},
+                headers={"Content-Type": "application/json", "Origin": "https://openworld.eu.org"},
+                timeout=20
+            )
+            print(f"   Clerk API sign_ins 响应: {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                # 从响应里提取 OAuth URL
+                if "oauth_url" in data:
+                    oauth_url = data["oauth_url"]
+                elif "external_account" in data:
+                    oauth_url = data.get("external_account", {}).get("oauth_url", "")
+                print(f"   OAuth URL: {oauth_url[:120] if oauth_url else 'N/A'}...")
+        except Exception as e:
+            print(f"   ⚠️ Clerk API 调用失败: {e}")
 
-    # 等 oauth_page URL 稳定到 discord.com
-    for _ in range(10):
-        if "discord.com" in oauth_page.url:
-            break
-        time.sleep(1)
+    # 如果还是没拿到 OAuth URL，直接用已知参数构造
+    if not oauth_url:
+        # 生成随机 state
+        import random
+        import string
+        state = ''.join(random.choices(string.ascii_lowercase + string.digits, k=50))
+        oauth_url = (
+            f"https://discord.com/oauth2/authorize"
+            f"?client_id={client_id}"
+            f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+            f"&response_type={response_type}"
+            f"&scope={urllib.parse.quote(scope, safe='')}"
+            f"&state={state}"
+            f"&prompt=none"
+            f"&access_type=offline"
+        )
+        print(f"   ⚠️ 使用直接构造的 OAuth URL（state 可能不匹配）")
 
-    current_url = oauth_page.url
-    print(f"   OAuth 页面 URL: {current_url}")
-    if "discord.com" not in current_url:
-        print(f"   ❌ OAuth 页面未到达 Discord: {current_url}")
-        save_screenshot(page, "clerk_no_discord_redirect")
-        return False
+    # ========== 第3步：用 Discord Token 调 API 完成授权 ==========
+    print(f"\n📌 第3步：通过 Discord API 完成授权")
 
-    # ========== 第4步：解析 Discord OAuth 参数 ==========
-    print(f"\n📌 第4步：解析 OAuth 参数")
-    oauth_url = oauth_page.url
-    print(f"   Discord OAuth URL: {oauth_url[:150]}...")
-
+    # 从 OAuth URL 解析参数
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
-
-    # 若当前是 discord.com/login?redirect_to=...（Discord 要求先登录），
-    # 需二次解析 redirect_to 里 URL 编码的 authorize 参数
-    if "client_id" not in params:
-        redirect_to = params.get("redirect_to", [""])[0]
-        if redirect_to:
-            full_auth = urllib.parse.urljoin("https://discord.com", redirect_to)
-            print(f"   🔍 从 redirect_to 解析: {full_auth[:150]}...")
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(full_auth).query)
 
     client_id    = params.get("client_id", [""])[0]
     redirect_uri = params.get("redirect_uri", [""])[0]
@@ -474,13 +327,11 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
 
     if not client_id or not redirect_uri:
-        print("   ❌ 无法解析关键 OAuth 参数 (client_id 或 redirect_uri)")
+        print("   ❌ 无法解析关键 OAuth 参数")
         save_screenshot(page, "login_failed_parse")
         return False
 
-    # ========== 第5步：通过 Discord API 完成授权 ==========
-    print(f"\n📌 第5步：通过 Discord API 完成授权")
-
+    # 调 Discord API
     api_params = urllib.parse.urlencode({
         "client_id":     client_id,
         "response_type": response_type,
@@ -534,26 +385,23 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     masked_location = re.sub(r"code=[^&]+", "code=***", location)
     print(f"   ✅ 拿到回调 URL: {masked_location}")
 
-    # ========== 第6步：用回调 URL 完成 Clerk 登录 ==========
-    print(f"\n📌 第6步：通过回调 URL 完成 Clerk 登录")
+    # ========== 第4步：用回调 URL 完成登录 ==========
+    print(f"\n📌 第4步：通过回调 URL 完成登录")
 
-    # 在 OAuth popup 里 goto 回调 URL，Clerk popup 收到回调后会关闭，
-    # 主页面自动建立会话并 POST /auth/clerk-callback 跳转 dashboard
     try:
-        oauth_page.goto(location, wait_until="domcontentloaded", timeout=30000)
+        page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        print(f"   ⚠️ 回调页面加载异常（popup 可能已关闭，属正常）: {e}")
+        print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
 
-    # 等待主页面离开 /login 到 dashboard
     time.sleep(6)
     wait_for_cloudflare(page)
 
     final_url = page.url
-    print(f"   回调后主页面 URL: {final_url}")
+    print(f"   回调后 URL: {final_url}")
 
-    # 等待离开 /login 到 dashboard（最多 25 秒）
+    # 等待离开 /login 到 dashboard
     for _ in range(25):
-        if "/login" not in page.url and "discord.com" not in page.url:
+        if "/login" not in page.url:
             break
         time.sleep(1)
     final_url = page.url
@@ -567,6 +415,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         print(f"   ✅ 登录成功！当前 URL: {final_url}")
         save_screenshot(page, "login_success")
         return True
+
+    print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
+    save_screenshot(page, "login_uncertain")
+    return True
 
     print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
     save_screenshot(page, "login_uncertain")
