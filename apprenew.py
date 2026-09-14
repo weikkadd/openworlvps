@@ -327,10 +327,11 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, "clerk_no_discord_btn")
         return False
 
-    # 等待 Discord OAuth 页面出现（popup 或同页跳转）
+    # 等待 Discord OAuth 页面出现（popup 或同页跳转）。sign_ins 可能被
+    # Cloudflare 挂起 15 秒以上才响应，等待放宽到 45 秒。
     print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转）...")
     oauth_page = None
-    for _ in range(15):
+    for _ in range(45):
         time.sleep(1)
         if popups:
             oauth_page = popups[0]
@@ -410,26 +411,22 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, "clerk_no_discord_redirect")
         return False
 
-    # 等待跳转到 Discord OAuth
-    print("   ⏳ 等待跳转到 Discord OAuth...")
-    for _ in range(15):
-        time.sleep(1)
-        if "discord.com" in page.url:
-            break
-    current_url = page.url
-    print(f"   跳转后 URL: {current_url}")
-    if "discord.com" not in current_url:
-        print(f"   ❌ 未跳转到 Discord，当前: {current_url}")
-        save_screenshot(page, "clerk_no_discord_redirect")
-        return False
-
     # ========== 第4步：解析 Discord OAuth 参数 ==========
     print(f"\n📌 第4步：解析 OAuth 参数")
     oauth_url = oauth_page.url
-    print(f"   Discord OAuth URL: {oauth_url[:120]}...")
+    print(f"   Discord OAuth URL: {oauth_url[:150]}...")
 
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
+
+    # 若当前是 discord.com/login?redirect_to=...（Discord 要求先登录），
+    # 需二次解析 redirect_to 里 URL 编码的 authorize 参数
+    if "client_id" not in params:
+        redirect_to = params.get("redirect_to", [""])[0]
+        if redirect_to:
+            full_auth = urllib.parse.urljoin("https://discord.com", redirect_to)
+            print(f"   🔍 从 redirect_to 解析: {full_auth[:150]}...")
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(full_auth).query)
 
     client_id    = params.get("client_id", [""])[0]
     redirect_uri = params.get("redirect_uri", [""])[0]
