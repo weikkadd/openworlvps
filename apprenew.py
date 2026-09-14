@@ -259,6 +259,14 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         "button[aria-label*='Discord']",
     ]
 
+    # 监听 popup（Clerk 社交登录会在新窗口打开 Discord OAuth）
+    popups = []
+
+    def _collect_popup(p):
+        popups.append(p)
+
+    page.context.on("page", _collect_popup)
+
     clicked_discord = False
     for sel in discord_selectors:
         try:
@@ -272,8 +280,43 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             continue
 
     if not clicked_discord:
+        page.context.remove_listener("page", _collect_popup)
         print("   ❌ 未找到 Discord 登录按钮")
         save_screenshot(page, "clerk_no_discord_btn")
+        return False
+
+    # 等待 Discord OAuth 页面出现（popup 或同页跳转）
+    print("   ⏳ 等待 Discord OAuth 页面（popup 或同页跳转）...")
+    oauth_page = None
+    for _ in range(15):
+        time.sleep(1)
+        if popups:
+            oauth_page = popups[0]
+            print(f"   🪟 捕获到 OAuth popup")
+            break
+        if "discord.com" in page.url:
+            oauth_page = page
+            print(f"   🔗 主页面跳转到 Discord")
+            break
+
+    page.context.remove_listener("page", _collect_popup)
+
+    if oauth_page is None:
+        print(f"   ❌ 未跳转到 Discord，当前: {page.url}")
+        save_screenshot(page, "clerk_no_discord_redirect")
+        return False
+
+    # 等 oauth_page URL 稳定到 discord.com
+    for _ in range(10):
+        if "discord.com" in oauth_page.url:
+            break
+        time.sleep(1)
+
+    current_url = oauth_page.url
+    print(f"   OAuth 页面 URL: {current_url}")
+    if "discord.com" not in current_url:
+        print(f"   ❌ OAuth 页面未到达 Discord: {current_url}")
+        save_screenshot(page, "clerk_no_discord_redirect")
         return False
 
     # 等待跳转到 Discord OAuth
@@ -291,7 +334,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # ========== 第4步：解析 Discord OAuth 参数 ==========
     print(f"\n📌 第4步：解析 OAuth 参数")
-    oauth_url = page.url
+    oauth_url = oauth_page.url
     print(f"   Discord OAuth URL: {oauth_url[:120]}...")
 
     parsed = urllib.parse.urlparse(oauth_url)
@@ -372,20 +415,22 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     # ========== 第6步：用回调 URL 完成 Clerk 登录 ==========
     print(f"\n📌 第6步：通过回调 URL 完成 Clerk 登录")
 
+    # 在 OAuth popup 里 goto 回调 URL，Clerk popup 收到回调后会关闭，
+    # 主页面自动建立会话并 POST /auth/clerk-callback 跳转 dashboard
     try:
-        page.goto(location, wait_until="domcontentloaded", timeout=30000)
+        oauth_page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
+        print(f"   ⚠️ 回调页面加载异常（popup 可能已关闭，属正常）: {e}")
 
-    # Clerk 回调后会自动 POST /auth/clerk-callback 并跳转 dashboard，等待跳转
+    # 等待主页面离开 /login 到 dashboard
     time.sleep(6)
     wait_for_cloudflare(page)
 
     final_url = page.url
-    print(f"   回调后 URL: {final_url}")
+    print(f"   回调后主页面 URL: {final_url}")
 
-    # 等待离开 /login 到 dashboard（最多 20 秒）
-    for _ in range(20):
+    # 等待离开 /login 到 dashboard（最多 25 秒）
+    for _ in range(25):
         if "/login" not in page.url and "discord.com" not in page.url:
             break
         time.sleep(1)
