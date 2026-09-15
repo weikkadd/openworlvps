@@ -451,7 +451,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 回调页面加载异常（可能正常）: {e}")
 
-    time.sleep(6)
+    time.sleep(5)
     wait_for_cloudflare(page)
 
     final_url = page.url
@@ -464,24 +464,51 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, f"clerk_callback_err_{err_code}")
         return False
 
-    for _ in range(25):
-        if "/login" not in page.url:
+    # 等待 SSO 处理完成并跳回 openworld（fallback redirect_url 为 /login）
+    print("   ⏳ 等待 SSO 处理完成并跳回 openworld.eu.org...")
+    for _ in range(30):
+        cur = page.url
+        if "accounts.openworld.eu.org" in cur and "sso-callback" in cur:
+            time.sleep(1)
+            continue
+        if "openworld.eu.org" in cur and "accounts." not in cur:
             break
         time.sleep(1)
+    time.sleep(3)
+    print(f"   跳回后 URL: {page.url}")
+
+    # SSO 跳回 /login 后，Clerk JS 检测到 session 会自动 POST /auth/clerk-callback
+    # 交换真正的面板 session。访问 /dashboard 验证登录态是否建立。
+    try:
+        page.goto(f"{SITE_BASE}/dashboard", wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+        time.sleep(5)
+    except Exception as e:
+        print(f"   ⚠️ 访问 dashboard 异常: {e}")
+
     final_url = page.url
+    print(f"   访问 dashboard 后 URL: {final_url}")
+
+    if "/login" in final_url:
+        # 可能 SSO 尚未处理完，再等一轮重试
+        print("   ⚠️ 仍被重定向到登录页，等待 Clerk session 交换...")
+        time.sleep(10)
+        try:
+            page.goto(f"{SITE_BASE}/dashboard", wait_until="domcontentloaded", timeout=30000)
+            wait_for_cloudflare(page)
+            time.sleep(3)
+        except Exception:
+            pass
+        final_url = page.url
+        print(f"   重试后 URL: {final_url}")
 
     if "/login" in final_url:
         print(f"   ❌ 登录失败，仍停留在登录页: {final_url}")
         save_screenshot(page, "clerk_login_stuck")
         return False
 
-    if "openworld.eu.org" in final_url:
-        print(f"   ✅ 登录成功！当前 URL: {final_url}")
-        save_screenshot(page, "login_success")
-        return True
-
-    print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
-    save_screenshot(page, "login_uncertain")
+    print(f"   ✅ 登录成功！当前 URL: {final_url}")
+    save_screenshot(page, "login_success")
     return True
 
 def extract_gif_frames(gif_bytes: bytes) -> list:
