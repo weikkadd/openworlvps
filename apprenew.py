@@ -251,12 +251,16 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     oauth_url = ""
     state = ""
 
-    def _replay(body_str):
+    _C_LERK_QUERY = "__clerk_api_version=2026-05-12&_clerk_js_version=6.31.0"
+
+    def _replay_signins(body_str):
+        # 前端请求体是 form 格式（a=b&c=d），必须用 form 编码重放，否则
+        # Clerk 按 JSON 解析失败返回 needs_identifier
         return requests.post(
-            "https://clerk.openworld.eu.org/v1/client/sign_ins",
+            f"https://clerk.openworld.eu.org/v1/client/sign_ins?{_C_LERK_QUERY}",
             data=body_str,
             headers={
-                "Content-Type": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": SITE_BASE,
                 "Referer": f"{SITE_BASE}/login",
                 "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -266,46 +270,78 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             timeout=30,
         )
 
-    candidates = [real_body]
+    def _replay_authentications(attempt_id, body_str):
+        # 第二步：对已创建的 sign-in attempt 开始第三方 OAuth 验证，
+        # 该响应中才会带外部验证 URL（external_verification / oauth_url）
+        return requests.post(
+            f"https://clerk.openworld.eu.org/v1/client/sign_ins/{attempt_id}/authentications?{_C_LERK_QUERY}",
+            data=body_str,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": SITE_BASE,
+                "Referer": f"{SITE_BASE}/login",
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+            },
+            cookies=cookie_dict,
+            timeout=30,
+        )
+
+    # ---- 第4.1步：重放 sign_ins 创建 attempt ----
+    attempt_id = ""
+    resp = _replay_signins(real_body)
+    print(f"   sign_ins 重放: HTTP {resp.status_code}")
     try:
-        rb_dict = json.loads(real_body)
-        if isinstance(rb_dict, dict):
-            if "action_complete_redirect_url" not in rb_dict:
-                rb2 = dict(rb_dict)
-                rb2["action_complete_redirect_url"] = f"{SITE_BASE}/login"
-                candidates.append(json.dumps(rb2))
-            if "redirect_url" not in rb_dict:
-                rb3 = dict(rb_dict)
-                rb3["redirect_url"] = f"{SITE_BASE}/login"
-                candidates.append(json.dumps(rb3))
+        data = resp.json()
+        print(f"   响应体: {json.dumps(data, ensure_ascii=False)[:600]}")
     except Exception:
-        pass
+        data = {}
+        print(f"   响应文本: {resp.text[:300]}")
 
-    for idx, body_str in enumerate(candidates):
+    # Clerk 响应可能包在 "response" 字段里（如上轮日志所见）
+    inner = data.get("response", data)
+    attempt_id = inner.get("id", "")
+    if not oauth_url:
+        oauth_url = inner.get("oauth_url", "")
+
+    # ---- 第4.2步：若 attempt 已创建，调用 authentications 端点触发 OAuth ----
+    if attempt_id and not oauth_url:
+        print(f"   📦 sign-in attempt: {attempt_id}")
+        auth_body = (
+            f"strategy=oauth_discord"
+            f"&redirect_url={urllib.parse.quote('https://accounts.openworld.eu.org/sign-in#/sso-callback?sign_in_fallback_redirect_url=https%3A%2F%2Fopenworld.eu.org%2Flogin', safe='')}"
+            f"&action_complete_redirect_url={urllib.parse.quote(SITE_BASE + '/login', safe='')}"
+        )
         try:
-            resp = _replay(body_str)
-            print(f"   重放 #{idx + 1}: HTTP {resp.status_code}")
-            data = {}
+            resp2 = _replay_authentications(attempt_id, auth_body)
+            print(f"   authentications 重放: HTTP {resp2.status_code}")
+            data2 = {}
             try:
-                data = resp.json()
-                print(f"   响应体: {json.dumps(data, ensure_ascii=False)[:600]}")
+                data2 = resp2.json()
+                print(f"   响应体: {json.dumps(data2, ensure_ascii=False)[:800]}")
             except Exception:
-                pass
-            external = data.get("external_account") or {}
-            if isinstance(external, dict):
-                oauth_url = external.get("oauth_url", "")
+                print(f"   响应文本: {resp2.text[:400]}")
 
-            state = data.get("state", "")
-            ffv = data.get("first_factor_verification") or {}
-            if isinstance(ffv, dict) and not oauth_url:
-                oauth_url = ffv.get("external_verification_redirect_url", "") or ""
+            # 从 authentications 响应中提取外部验证 URL
+            inner2 = data2.get("response", data2)
+            ffv = inner2.get("first_factor_verification") or {}
+            if isinstance(ffv, dict):
+                ev = ffv.get("external_verification") or {}
+                if isinstance(ev, dict):
+                    oauth_url = ev.get("redirect_url", "") or ev.get("url", "")
+                if not oauth_url:
+                    oauth_url = ffv.get("external_verification_redirect_url", "")
             if not oauth_url:
-                oauth_url = data.get("oauth_url", "")
-            if oauth_url or state:
-                break
+                oauth_url = inner2.get("oauth_url", "")
+            state = inner2.get("state", "") or state
+            if not oauth_url and not state:
+                # 打印完整尝试提取所有可能含 URL/state 的字段
+                print(f"   🔍 authentications 原始字段: "
+                      f"{list(inner2.keys()) if isinstance(inner2, dict) else type(inner2)}")
         except Exception as e:
-            print(f"   重放异常: {e}")
+            print(f"   ⚠️ authentications 请求异常: {e}")
 
+    # 兜底：有 state 但无 oauth_url 时用 state 构造
     if not oauth_url and state:
         client_id = "1525633239555772426"
         redirect_uri = "https://clerk.openworld.eu.org/v1/oauth_callback"
