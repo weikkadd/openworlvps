@@ -207,10 +207,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # ========== 第3步：捕获浏览器同源 OAuth 跳转 URL ==========
     print(f"\n📌 第3步：点击 Discord 并捕获同源 OAuth URL")
-    # 关键修复：直接拦截「浏览器自己即将跳往 Discord 的 OAuth 授权 URL」。该 URL
-    # 由 Clerk 前端为【当前浏览器 Clerk client 会话】生成，其 state 与浏览器会话
-    # 100% 同源。之前用 requests 重放 sign_ins 会新建一个独立 attempt（state 与之
-    # 不同源），导致回调时 Clerk 校验 state 失败、落到 sign_in_fallback_redirect_url。
+    # 关键修复：Discord OAuth 是在【弹窗 popup】里完成的，主页面 page.route 看不到
+    # popup 的请求，必须用 context.route（覆盖 context 内所有页面含 popup）拦截。
+    # 该 OAuth URL 由 Clerk 前端为【当前浏览器 Clerk client 会话】生成，state 与
+    # 主页面会话 100% 同源。之前用 requests 重放会新建独立 attempt（state 不同源），
+    # 导致回调时 Clerk 校验 state 失败、落到 sign_in_fallback_redirect_url。
+    ctx = page.context
     oauth_capture = {"url": ""}
 
     def _capture_oauth_route(route, request):
@@ -219,14 +221,14 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             if not oauth_capture["url"]:
                 oauth_capture["url"] = u
             try:
-                # 只拦截 URL，不真正放行浏览器导航到 Discord（避免页面卡在 Discord
+                # 只拦截 URL，不真正放行浏览器导航到 Discord（避免 popup 卡在 Discord
                 # 登录页 / CF 挑战，干扰后续 page.goto 回调）。Clerk 的 attempt 已
                 # 在点击 Discord 时创建于浏览器会话中，abort 此导航不会清理它。
                 route.abort()
             except Exception:
                 pass
 
-    page.route("**/oauth2/authorize**", _capture_oauth_route)
+    ctx.route("**/discord.com/oauth2/authorize**", _capture_oauth_route)
 
     # 兜底：监听浏览器 sign_ins 响应，以便 route 未命中时仍能取出 OAuth URL
     sign_ins_bodies = []
@@ -266,7 +268,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         time.sleep(0.5)
     time.sleep(2)
     try:
-        page.unroute("**/oauth2/authorize**", _capture_oauth_route)
+        ctx.unroute("**/discord.com/oauth2/authorize**", _capture_oauth_route)
     except Exception:
         pass
     page.remove_listener("request", _capture_signins)
