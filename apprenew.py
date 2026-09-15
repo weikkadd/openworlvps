@@ -173,214 +173,199 @@ def wait_for_cloudflare(page, timeout=15):
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     """
-    绕过 Clerk JS 流程，直接用 Discord Token 完成 OAuth 授权登录。
-
-    流程：
-    1. 访问 /login 获取 CSRF token（从 cookie）
-    2. 用已知 OAuth 参数构造 Discord OAuth URL
-    3. 用 Discord Token 调 /api/v9/oauth2/authorize 拿 location
-    4. goto Clerk oauth_callback 完成登录
+    捕获 Clerk 前端真实 sign_ins 请求体并用 requests 重放，拿到有效 OAuth URL 后
+    用 Discord Token 直调 API 完成授权登录（规避 Clerk JS + Cloudflare 挂起）。
     """
     print("=" * 50)
-    print("🔑 开始 Discord OAuth 直连登录（绕过 Clerk）")
+    print("🔑 开始捕获真实 sign_ins + Discord Token 授权登录")
     print("=" * 50)
 
-    # ========== 第1步：访问 /login 建立 session 和 CSRF token ==========
-    login_url = f"{SITE_BASE}/login"
-    print(f"\n📌 第1步：访问登录页建立 session: {login_url}")
+    # ========== 第1步：访问 /login，等待 Clerk 加载 ==========
+    print(f"\n📌 第1步：访问登录页: {SITE_BASE}/login")
     try:
-        page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(f"{SITE_BASE}/login", wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
         time.sleep(3)
     except Exception as e:
         print(f"   ⚠️ 登录页加载异常: {e}")
     print(f"   当前 URL: {page.url}")
 
-    # 获取 CSRF token
-    csrf_token = ""
+    # ========== 第2步：点击 Sign in 打开 Clerk 弹窗 ==========
+    print(f"\n📌 第2步：点击 Sign in 打开 Clerk 弹窗")
     try:
-        cookies = page.context.cookies()
-        for c in cookies:
-            if c["name"] == "csrf_token":
-                csrf_token = c["value"]
-                break
-    except Exception:
-        pass
-    print(f"   CSRF token: {'已获取' if csrf_token else '未找到'}")
-
-    # ========== 第2步：用 Clerk API 创建 sign-in 尝试获取 OAuth 参数 ==========
-    print(f"\n📌 第2步：通过 Clerk API 创建 sign-in 尝试")
-
-    # Clerk 的 Discord OAuth 应用信息（从之前的跳转中提取）
-    client_id = "1525633239555772426"
-    redirect_uri = "https://clerk.openworld.eu.org/v1/oauth_callback"
-    scope = "identify email"
-    response_type = "code"
-
-    # 先尝试 Clerk API 获取 state（POST /v1/client/sign_ins）
-    state = ""
-    try:
-        resp = page.evaluate(f"""
-            async () => {{
-                try {{
-                    const r = await fetch('/login', {{ method: 'GET', credentials: 'include' }});
-                    const text = await r.text();
-                    // 从 Clerk JS 初始化脚本中提取 publishable key
-                    const match = text.match(/data-clerk-publishable-key="([^"]+)"/);
-                    return match ? match[1] : null;
-                }} catch (e) {{
-                    return null;
-                }}
-            }}
-        """)
-        if resp:
-            print(f"   Clerk publishable key: {resp[:40]}...")
-    except Exception:
-        pass
-
-    # 尝试从 Clerk JS 获取 OAuth URL
-    oauth_url = ""
-    try:
-        # 等待 Clerk JS 加载
-        time.sleep(2)
-        oauth_url = page.evaluate("""
-            async () => {
-                if (!window.Clerk) return null;
-                try {
-                    // 创建 sign-in 尝试并获取 OAuth URL
-                    const signIn = await window.Clerk.client.createSignIn({
-                        strategy: 'oauth_discord',
-                        redirectUrl: window.location.href
-                    });
-                    const url = await signIn.authenticateWithRedirect({
-                        redirectUrl: window.location.href,
-                        baseUrl: window.location.origin
-                    });
-                    return url || null;
-                } catch (e) {
-                    return null;
-                }
-            }
-        """)
-        if oauth_url:
-            print(f"   ✅ 从 Clerk JS 获取 OAuth URL: {oauth_url[:120]}...")
+        signin_btn = page.locator("#clerk-signin").first
+        if signin_btn.is_visible(timeout=10000):
+            for _ in range(20):
+                if not signin_btn.get_attribute("disabled"):
+                    break
+                time.sleep(0.5)
+            signin_btn.click()
+            print("   ✅ 已点击 Sign in")
+            time.sleep(3)
     except Exception as e:
-        print(f"   ⚠️ Clerk JS 获取 OAuth URL 失败: {e}")
-        oauth_url = ""
+        print(f"   ⚠️ 点击 Sign in 失败: {e}")
 
-    # 如果 Clerk JS 失败，直接构造 OAuth URL
-    if not oauth_url:
-        # 用 Clerk API 获取 state 和 OAuth URL
+    # ========== 第3步：捕获前端点击 Discord 时发出的 sign_ins 请求体 ==========
+    print(f"\n📌 第3步：点击 Discord 并捕获真实请求体")
+    sign_ins_bodies = []
+
+    def _capture_signins(req):
+        if req.method == "POST" and "sign_ins" in req.url:
+            pd = req.post_data
+            if pd and pd not in sign_ins_bodies:
+                sign_ins_bodies.append(pd)
+
+    page.on("request", _capture_signins)
+
+    clicked = False
+    for sel in ["button:has-text('Discord')",
+                "[data-clerk-social-strategy='discord']",
+                "[class*='discord']"]:
         try:
-            resp = requests.post(
-                "https://clerk.openworld.eu.org/v1/client/sign_ins",
-                json={"strategy": "oauth_discord", "redirect_url": "https://openworld.eu.org/"},
-                headers={"Content-Type": "application/json", "Origin": "https://openworld.eu.org"},
-                timeout=20
-            )
-            print(f"   Clerk API sign_ins 响应: {resp.status_code}")
-            if resp.status_code == 200:
-                data = resp.json()
-                print(f"   sign_ins 响应体: {json.dumps(data, ensure_ascii=False)[:500]}")
-                # 1. 优先提取 external_account.oauth_url
-                ext_acc = data.get("external_account", {})
-                if isinstance(ext_acc, dict):
-                    oauth_url = ext_acc.get("oauth_url", "")
-                if not oauth_url:
-                    # 2. 尝试顶层 oauth_url
-                    oauth_url = data.get("oauth_url", "")
-                # 3. 提取 state（无论是否有 oauth_url 都要取）
-                state = data.get("state", "")
-                if oauth_url:
-                    print(f"   ✅ 从 Clerk API 获取 OAuth URL: {oauth_url[:150]}...")
-                elif state:
-                    print(f"   ✅ 从 Clerk API 获取 state: {state[:30]}...")
-        except Exception as e:
-            print(f"   ⚠️ Clerk API 调用失败: {e}")
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=2000):
+                print(f"   点击 Discord 按钮 (选择器: {sel})")
+                loc.click(timeout=5000)
+                clicked = True
+                break
+        except Exception:
+            continue
 
-    # 如果还是没拿到 OAuth URL，用 Clerk API 返回的 state 构造
-    if not oauth_url:
-        if not state:
-            # 备用：用 page 从 Clerk JS 获取 state
+    wait_start = time.time()
+    while not sign_ins_bodies and time.time() - wait_start < 30:
+        time.sleep(0.5)
+    page.remove_listener("request", _capture_signins)
+
+    if not sign_ins_bodies:
+        print("   ❌ 未捕获到 sign_ins 请求体")
+        save_screenshot(page, "signins_not_captured")
+        return False
+    real_body = sign_ins_bodies[0]
+    print(f"   📨 捕获前端 sign_ins 请求体: {real_body[:400]}")
+
+    # ========== 第4步：重放请求获取 OAuth URL / state ==========
+    print(f"\n📌 第4步：重放 sign_ins 请求获取 OAuth 信息")
+    browser_cookies = page.context.cookies()
+    cookie_dict = {c["name"]: c["value"] for c in browser_cookies}
+
+    oauth_url = ""
+    state = ""
+
+    def _replay(body_str):
+        return requests.post(
+            "https://clerk.openworld.eu.org/v1/client/sign_ins",
+            data=body_str,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": SITE_BASE,
+                "Referer": f"{SITE_BASE}/login",
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+            },
+            cookies=cookie_dict,
+            timeout=30,
+        )
+
+    candidates = [real_body]
+    try:
+        rb_dict = json.loads(real_body)
+        if isinstance(rb_dict, dict):
+            if "action_complete_redirect_url" not in rb_dict:
+                rb2 = dict(rb_dict)
+                rb2["action_complete_redirect_url"] = f"{SITE_BASE}/login"
+                candidates.append(json.dumps(rb2))
+            if "redirect_url" not in rb_dict:
+                rb3 = dict(rb_dict)
+                rb3["redirect_url"] = f"{SITE_BASE}/login"
+                candidates.append(json.dumps(rb3))
+    except Exception:
+        pass
+
+    for idx, body_str in enumerate(candidates):
+        try:
+            resp = _replay(body_str)
+            print(f"   重放 #{idx + 1}: HTTP {resp.status_code}")
+            data = {}
             try:
-                state = page.evaluate("""
-                    async () => {
-                        if (!window.Clerk) return null;
-                        try {
-                            const signIn = await window.Clerk.client.createSignIn({
-                                strategy: 'oauth_discord',
-                                redirectUrl: window.location.href
-                            });
-                            return signIn.state || null;
-                        } catch (e) { return null; }
-                    }
-                """)
-                if state:
-                    print(f"   ✅ 从 Clerk JS 获取 state: {state[:30]}...")
+                data = resp.json()
+                print(f"   响应体: {json.dumps(data, ensure_ascii=False)[:600]}")
             except Exception:
                 pass
-        if not state:
-            import random
-            import string
-            state = ''.join(random.choices(string.ascii_lowercase + string.digits, k=50))
-            print(f"   ⚠️ 使用随机 state（Clerk state 未知，可能失败）")
+            external = data.get("external_account") or {}
+            if isinstance(external, dict):
+                oauth_url = external.get("oauth_url", "")
+
+            state = data.get("state", "")
+            ffv = data.get("first_factor_verification") or {}
+            if isinstance(ffv, dict) and not oauth_url:
+                oauth_url = ffv.get("external_verification_redirect_url", "") or ""
+            if not oauth_url:
+                oauth_url = data.get("oauth_url", "")
+            if oauth_url or state:
+                break
+        except Exception as e:
+            print(f"   重放异常: {e}")
+
+    if not oauth_url and state:
+        client_id = "1525633239555772426"
+        redirect_uri = "https://clerk.openworld.eu.org/v1/oauth_callback"
         oauth_url = (
             f"https://discord.com/oauth2/authorize"
             f"?client_id={client_id}"
             f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
-            f"&response_type={response_type}"
-            f"&scope={urllib.parse.quote(scope, safe='')}"
+            f"&response_type=code"
+            f"&scope={urllib.parse.quote('identify email', safe='')}"
             f"&state={state}"
             f"&prompt=consent"
             f"&access_type=offline"
         )
-        print(f"   🔗 OAuth URL: {oauth_url[:150]}...")
+        print(f"   🔗 用获取到的 state 构造 OAuth URL")
 
-    # ========== 第3步：用 Discord Token 调 API 完成授权 ==========
-    print(f"\n📌 第3步：通过 Discord API 完成授权")
+    if not oauth_url:
+        print("   ❌ 未能获取 OAuth URL/state")
+        save_screenshot(page, "oauth_url_not_found")
+        return False
+    print(f"   ✅ OAuth URL: {oauth_url[:160]}...")
 
-    # 从 OAuth URL 解析参数
+    # ========== 第5步：用 Discord Token 调 API 完成授权 ==========
+    print(f"\n📌 第5步：通过 Discord API 完成授权")
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
-
-    client_id    = params.get("client_id", [""])[0]
+    client_id = params.get("client_id", [""])[0]
     redirect_uri = params.get("redirect_uri", [""])[0]
-    scope        = params.get("scope", ["identify email"])[0]
-    state        = params.get("state", [""])[0]
+    scope = params.get("scope", ["identify email"])[0]
+    state = params.get("state", [""])[0]
     response_type = params.get("response_type", ["code"])[0]
 
     print(f"   Client ID:    {client_id}")
     print(f"   Redirect URI: {redirect_uri}")
     print(f"   Scope:        {scope}")
     print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
-
     if not client_id or not redirect_uri:
         print("   ❌ 无法解析关键 OAuth 参数")
         save_screenshot(page, "login_failed_parse")
         return False
 
-    # 调 Discord API
     api_params = urllib.parse.urlencode({
-        "client_id":     client_id,
+        "client_id": client_id,
         "response_type": response_type,
-        "redirect_uri":  redirect_uri,
-        "scope":         scope,
-        "state":         state,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
     })
     authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
     referer = f"https://discord.com/oauth2/authorize?{api_params}"
 
     headers = {
-        "accept":           "*/*",
-        "authorization":    dc_token.strip(),
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        "accept": "*/*",
+        "authorization": dc_token.strip(),
+        "content-type": "application/json",
+        "origin": "https://discord.com",
+        "referer": referer,
+        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
         "x-discord-locale": "zh-CN",
     }
-
     body = {
         "permissions": "0",
         "authorize": True,
@@ -413,9 +398,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     masked_location = re.sub(r"code=[^&]+", "code=***", location)
     print(f"   ✅ 拿到回调 URL: {masked_location}")
 
-    # ========== 第4步：用回调 URL 完成登录 ==========
-    print(f"\n📌 第4步：通过回调 URL 完成登录")
-
+    # ========== 第6步：用回调 URL 完成登录 ==========
+    print(f"\n📌 第6步：通过回调 URL 完成登录")
     try:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
@@ -427,7 +411,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     final_url = page.url
     print(f"   回调后 URL: {final_url}")
 
-    # 检查 Clerk 回调错误（err_code=authorization_invalid 等）
     if "err_code=" in final_url:
         err_match = re.search(r"err_code=([^&#]+)", final_url)
         err_code = err_match.group(1) if err_match else "unknown"
@@ -435,7 +418,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         save_screenshot(page, f"clerk_callback_err_{err_code}")
         return False
 
-    # 等待离开 /login 到 dashboard
     for _ in range(25):
         if "/login" not in page.url:
             break
@@ -455,11 +437,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
     save_screenshot(page, "login_uncertain")
     return True
-
-    print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
-    save_screenshot(page, "login_uncertain")
-    return True
-
 
 def extract_gif_frames(gif_bytes: bytes) -> list:
     """提取 GIF 所有帧为 PIL Image 列表"""
