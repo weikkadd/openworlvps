@@ -304,7 +304,17 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     if not oauth_url:
         oauth_url = inner.get("oauth_url", "")
 
-    # ---- 第4.2步：若 attempt 已创建，调用 authentications 端点触发 OAuth ----
+    # 关键：OAuth URL 藏在 first_factor_verification.external_verification_redirect_url 里
+    if not oauth_url:
+        ffv = inner.get("first_factor_verification") or {}
+        if isinstance(ffv, dict):
+            oauth_url = ffv.get("external_verification_redirect_url", "") or ""
+            if not oauth_url:
+                state = ffv.get("verification_state", "") or state
+            if oauth_url:
+                print(f"   🔗 从 first_factor_verification 提取到 OAuth URL")
+
+    # ---- 第4.2步：若 attempt 已创建但还没拿到 OAuth URL，尝试 authentications 端点 ----
     if attempt_id and not oauth_url:
         print(f"   📦 sign-in attempt: {attempt_id}")
         auth_body = (
