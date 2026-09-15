@@ -217,6 +217,25 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     page.on("request", _capture_signins)
 
+    # 同时监听浏览器自己发出的 sign_ins 响应，直接从中拿到 OAuth URL / state。
+    # 这是关键修复：浏览器点击 Discord 时其 Clerk client 已创建一个 sign-in attempt
+    # （带 state A）；若再用 requests 重放会新建 attempt（state B），之后拿 B 的
+    # state 去换 code、却让浏览器带着 B 去请求回调，而浏览器 client 挂着 A →
+    # state 不一致 → Clerk 拒绝 OAuth 回调（落到 sign_in_fallback_redirect_url）。
+    # 直接从浏览器真实响应取 OAuth URL 可保证 state 与浏览器 client 同源对齐。
+    browser_signin_resp = {}
+
+    def _capture_signins_resp(resp):
+        if "sign_ins" in resp.url and resp.status == 200:
+            try:
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    browser_signin_resp["data"] = resp.json()
+            except Exception:
+                pass
+
+    page.on("response", _capture_signins_resp)
+
     clicked = False
     for sel in ["button:has-text('Discord')",
                 "[data-clerk-social-strategy='discord']",
@@ -234,7 +253,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     wait_start = time.time()
     while not sign_ins_bodies and time.time() - wait_start < 30:
         time.sleep(0.5)
+    # 等浏览器 sign_ins 响应落地后再移除监听，避免漏抓
+    time.sleep(2)
     page.remove_listener("request", _capture_signins)
+    page.remove_listener("response", _capture_signins_resp)
 
     if not sign_ins_bodies:
         print("   ❌ 未捕获到 sign_ins 请求体")
@@ -243,13 +265,29 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     real_body = sign_ins_bodies[0]
     print(f"   📨 捕获前端 sign_ins 请求体: {real_body[:400]}")
 
-    # ========== 第4步：重放请求获取 OAuth URL / state ==========
-    print(f"\n📌 第4步：重放 sign_ins 请求获取 OAuth 信息")
+    # 优先从浏览器真实 sign_ins 响应提取 OAuth URL（与浏览器 client 同源，
+    # state 一定对齐）；提取失败再走 requests 重放兜底。
+    browser_oauth_url = ""
+    browser_state = ""
+    browser_attempt_id = ""
+    _bsd = browser_signin_resp.get("data")
+    if _bsd:
+        _bin = _bsd.get("response", _bsd)
+        browser_attempt_id = _bin.get("id", "")
+        _ffv = _bin.get("first_factor_verification") or {}
+        browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
+        browser_state = _ffv.get("verification_state", "") or ""
+        if browser_oauth_url:
+            print("   🔗 从浏览器 sign_ins 响应直接提取到 OAuth URL（免重放）")
+
+    # ========== 第4步：优先用浏览器同源值，重放仅兜底 ==========
+    print(f"\n📌 第4步：获取 OAuth 信息（优先浏览器同源，重放兜底）")
     browser_cookies = page.context.cookies()
     cookie_dict = {c["name"]: c["value"] for c in browser_cookies}
 
-    oauth_url = ""
-    state = ""
+    oauth_url = browser_oauth_url
+    state = browser_state
+    attempt_id = browser_attempt_id
 
     _C_LERK_QUERY = "__clerk_api_version=2026-05-12&_clerk_js_version=6.31.0"
 
@@ -287,32 +325,39 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             timeout=30,
         )
 
-    # ---- 第4.1步：重放 sign_ins 创建 attempt ----
-    attempt_id = ""
-    resp = _replay_signins(real_body)
-    print(f"   sign_ins 重放: HTTP {resp.status_code}")
-    try:
-        data = resp.json()
-        print(f"   响应体: {json.dumps(data, ensure_ascii=False)[:600]}")
-    except Exception:
+    # ---- 第4.1步：仅在浏览器同源未拿到 OAuth URL/state 时，才用 requests 重放兜底 ----
+    # （重放会新建一个 attempt，state 与浏览器 client 不同源，正是登录被拒的根因，
+    #  所以同源值优先、重放仅兜底）
+    if oauth_url and state:
+        print("   ✅ 同源 OAuth URL + state 已就绪，跳过 sign_ins 重放")
         data = {}
-        print(f"   响应文本: {resp.text[:300]}")
+        inner = {}
+    else:
+        attempt_id = ""
+        resp = _replay_signins(real_body)
+        print(f"   sign_ins 重放: HTTP {resp.status_code}")
+        try:
+            data = resp.json()
+            print(f"   响应体: {json.dumps(data, ensure_ascii=False)[:600]}")
+        except Exception:
+            data = {}
+            print(f"   响应文本: {resp.text[:300]}")
 
-    # Clerk 响应可能包在 "response" 字段里（如上轮日志所见）
-    inner = data.get("response", data)
-    attempt_id = inner.get("id", "")
-    if not oauth_url:
-        oauth_url = inner.get("oauth_url", "")
+        # Clerk 响应可能包在 "response" 字段里（如上轮日志所见）
+        inner = data.get("response", data)
+        attempt_id = inner.get("id", "")
+        if not oauth_url:
+            oauth_url = inner.get("oauth_url", "")
 
-    # 关键：OAuth URL 藏在 first_factor_verification.external_verification_redirect_url 里
-    if not oauth_url:
-        ffv = inner.get("first_factor_verification") or {}
-        if isinstance(ffv, dict):
-            oauth_url = ffv.get("external_verification_redirect_url", "") or ""
-            if not oauth_url:
-                state = ffv.get("verification_state", "") or state
-            if oauth_url:
-                print(f"   🔗 从 first_factor_verification 提取到 OAuth URL")
+        # 关键：OAuth URL 藏在 first_factor_verification.external_verification_redirect_url 里
+        if not oauth_url:
+            ffv = inner.get("first_factor_verification") or {}
+            if isinstance(ffv, dict):
+                oauth_url = ffv.get("external_verification_redirect_url", "") or ""
+                if not oauth_url:
+                    state = ffv.get("verification_state", "") or state
+                if oauth_url:
+                    print(f"   🔗 从 first_factor_verification 提取到 OAuth URL")
 
     # ---- 第4.2步：若 attempt 已创建但还没拿到 OAuth URL，尝试 authentications 端点 ----
     if attempt_id and not oauth_url:
