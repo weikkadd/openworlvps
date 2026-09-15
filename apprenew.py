@@ -205,36 +205,59 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 点击 Sign in 失败: {e}")
 
-    # ========== 第3步：捕获浏览器 sign_ins 响应，提取同源 OAuth URL ==========
-    print(f"\n📌 第3步：点击 Discord 并捕获 sign_ins 响应中的同源 OAuth URL")
-    # 关键：sign_ins 可能是主页面发出，也可能在弹窗(popup)里发出。必须用
-    # context 级别的 request/response 监听器（覆盖 context 内所有页面含 popup），
-    # 才能稳定抓到 sign_ins 响应。响应体里的
-    # first_factor_verification.external_verification_redirect_url 就是 Clerk 为
-    # 【当前浏览器会话】生成的 Discord OAuth URL，其 state 与浏览器 attempt 同源。
-    # 直接用它 + 跳过 requests 重放，可避免 state 不同源导致 Clerk 拒绝回调。
-    # （不再依赖 page/context.route 拦截 popup 导航，因为该导航形态不稳定。）
+    # ========== 第3步：捕获浏览器同源 Discord OAuth URL ==========
+    print(f"\n📌 第3步：点击 Discord 并捕获同源 OAuth URL")
+    # 关键：点击 Discord 后 Clerk 会开一个 popup 跳往 discord.com 的 OAuth 授权
+    # 页，popup 的 URL 本身就是 Clerk 为【当前浏览器会话】生成的同源 OAuth URL
+    # （state 与浏览器 attempt 一致）。我们监听 context 的 popup 事件，从 popup
+    # 当前 URL 读出该 URL 后即刻关闭 popup，再让主页面用此 URL 完成授权回调。
+    # 这样既不需要重放 sign_ins（避免 state 不同源），也不依赖不稳定的 route 拦截。
     ctx = page.context
+    oauth_capture = {"url": ""}
+
+    def _on_popup(popup):
+        # popup 打开后立即轮询其 URL，直到出现 discord OAuth 授权地址
+        try:
+            for _ in range(60):
+                try:
+                    u = popup.url
+                except Exception:
+                    u = ""
+                if u and "discord.com" in u and "oauth2/authorize" in u:
+                    if not oauth_capture["url"]:
+                        oauth_capture["url"] = u
+                    break
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+    ctx.on("popup", _on_popup)
+
+    # 兜底：若 popup 未触发，仍监听 context 级 response，从 sign_ins/authentications
+    # 响应体里取 external_verification_redirect_url
     sign_ins_bodies = []
     browser_signin_data = {}
 
     def _on_req(req):
-        if req.method == "POST" and "sign_ins" in req.url and "authentications" not in req.url:
+        if req.method == "POST" and "sign_ins" in req.url:
             pd = req.post_data
             if pd and pd not in sign_ins_bodies:
                 sign_ins_bodies.append(pd)
 
     def _on_resp(resp):
         u = resp.url
-        if "sign_ins" in u and "authentications" not in u and resp.status == 200:
+        if "sign_ins" in u and resp.status == 200:
             try:
                 ct = resp.headers.get("content-type", "")
                 if "json" in ct:
                     d = resp.json()
-                    ffv = (d.get("response", d) if isinstance(d, dict) else {}).get(
-                        "first_factor_verification") or {}
-                    if isinstance(ffv, dict) and ffv.get("external_verification_redirect_url"):
-                        browser_signin_data["data"] = d
+                    _r = d.get("response", d) if isinstance(d, dict) else {}
+                    ffv = _r.get("first_factor_verification") or {}
+                    ev = ffv.get("external_verification") or {}
+                    url = (ffv.get("external_verification_redirect_url", "")
+                           or ev.get("redirect_url", "") or ev.get("url", ""))
+                    if url and not browser_signin_data:
+                        browser_signin_data["url"] = url
             except Exception:
                 pass
 
@@ -255,10 +278,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         except Exception:
             continue
 
+    # 等待 popup 里的 OAuth URL、或 sign_ins 响应里的 URL
     wait_start = time.time()
-    while (not browser_signin_data) and (not sign_ins_bodies) and time.time() - wait_start < 30:
+    while (not oauth_capture["url"]) and (not browser_signin_data) and time.time() - wait_start < 30:
         time.sleep(0.5)
-    time.sleep(2)
+    time.sleep(1)
+    ctx.remove_listener("popup", _on_popup)
     ctx.remove_listener("request", _on_req)
     ctx.remove_listener("response", _on_resp)
 
@@ -275,26 +300,21 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     else:
         print(f"   📨 捕获前端 sign_ins 请求体: {sign_ins_bodies[0][:160]}")
 
-    # ---- 从 sign_ins 响应提取同源 OAuth URL（覆盖主页面与 popup） ----
-    browser_oauth_url = ""
+    # ---- 优先从 popup URL 取，其次从 sign_ins 响应取 ----
+    browser_oauth_url = oauth_capture["url"] or browser_signin_data.get("url", "")
     browser_state = ""
     browser_attempt_id = ""
-    _bsd = browser_signin_data.get("data")
-    if _bsd:
-        _bin = _bsd.get("response", _bsd)
-        browser_attempt_id = _bin.get("id", "")
-        _ffv = _bin.get("first_factor_verification") or {}
-        browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
 
     if not browser_oauth_url:
-        print("   ❌ 未能从 sign_ins 响应获取同源 OAuth URL")
+        print("   ❌ 未能获取同源 OAuth URL（popup 与响应均未捕获）")
         save_screenshot(page, "oauth_url_not_found")
         return False
 
     # state 藏在 OAuth URL 查询参数里，与浏览器会话同源
     _q = urllib.parse.urlparse(browser_oauth_url).query
     browser_state = urllib.parse.parse_qs(_q).get("state", [""])[0]
-    print(f"   🔗 从浏览器 sign_ins 响应拿到同源 OAuth URL: {browser_oauth_url[:160]}...")
+    src = "popup" if oauth_capture["url"] else "sign_ins 响应"
+    print(f"   🔗 从浏览器{src}拿到同源 OAuth URL: {browser_oauth_url[:160]}...")
     if not browser_state:
         print("   ⚠️ OAuth URL 中未找到 state，将依赖第5步重新解析")
 
