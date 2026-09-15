@@ -205,26 +205,38 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 点击 Sign in 失败: {e}")
 
-    # ========== 第3步：捕获前端点击 Discord 时发出的 sign_ins 请求体 ==========
-    print(f"\n📌 第3步：点击 Discord 并捕获真实请求体")
-    sign_ins_bodies = []
+    # ========== 第3步：捕获浏览器同源 OAuth 跳转 URL ==========
+    print(f"\n📌 第3步：点击 Discord 并捕获同源 OAuth URL")
+    # 关键修复：直接拦截「浏览器自己即将跳往 Discord 的 OAuth 授权 URL」。该 URL
+    # 由 Clerk 前端为【当前浏览器 Clerk client 会话】生成，其 state 与浏览器会话
+    # 100% 同源。之前用 requests 重放 sign_ins 会新建一个独立 attempt（state 与之
+    # 不同源），导致回调时 Clerk 校验 state 失败、落到 sign_in_fallback_redirect_url。
+    oauth_capture = {"url": ""}
 
+    def _capture_oauth_route(route, request):
+        u = request.url
+        if "discord.com" in u and "oauth2/authorize" in u:
+            if not oauth_capture["url"]:
+                oauth_capture["url"] = u
+            try:
+                # 只拦截 URL，不真正放行浏览器导航到 Discord（避免页面卡在 Discord
+                # 登录页 / CF 挑战，干扰后续 page.goto 回调）。Clerk 的 attempt 已
+                # 在点击 Discord 时创建于浏览器会话中，abort 此导航不会清理它。
+                route.abort()
+            except Exception:
+                pass
+
+    page.route("**/oauth2/authorize**", _capture_oauth_route)
+
+    # 兜底：监听浏览器 sign_ins 响应，以便 route 未命中时仍能取出 OAuth URL
+    sign_ins_bodies = []
+    browser_signin_resp = {}
     def _capture_signins(req):
         if req.method == "POST" and "sign_ins" in req.url:
             pd = req.post_data
             if pd and pd not in sign_ins_bodies:
                 sign_ins_bodies.append(pd)
-
     page.on("request", _capture_signins)
-
-    # 同时监听浏览器自己发出的 sign_ins 响应，直接从中拿到 OAuth URL / state。
-    # 这是关键修复：浏览器点击 Discord 时其 Clerk client 已创建一个 sign-in attempt
-    # （带 state A）；若再用 requests 重放会新建 attempt（state B），之后拿 B 的
-    # state 去换 code、却让浏览器带着 B 去请求回调，而浏览器 client 挂着 A →
-    # state 不一致 → Clerk 拒绝 OAuth 回调（落到 sign_in_fallback_redirect_url）。
-    # 直接从浏览器真实响应取 OAuth URL 可保证 state 与浏览器 client 同源对齐。
-    browser_signin_resp = {}
-
     def _capture_signins_resp(resp):
         if "sign_ins" in resp.url and resp.status == 200:
             try:
@@ -233,7 +245,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                     browser_signin_resp["data"] = resp.json()
             except Exception:
                 pass
-
     page.on("response", _capture_signins_resp)
 
     clicked = False
@@ -251,37 +262,42 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             continue
 
     wait_start = time.time()
-    while not sign_ins_bodies and time.time() - wait_start < 30:
+    while (not oauth_capture["url"]) and (not sign_ins_bodies) and time.time() - wait_start < 30:
         time.sleep(0.5)
-    # 等浏览器 sign_ins 响应落地后再移除监听，避免漏抓
     time.sleep(2)
+    try:
+        page.unroute("**/oauth2/authorize**", _capture_oauth_route)
+    except Exception:
+        pass
     page.remove_listener("request", _capture_signins)
     page.remove_listener("response", _capture_signins_resp)
 
-    if not sign_ins_bodies:
-        print("   ❌ 未捕获到 sign_ins 请求体")
-        save_screenshot(page, "signins_not_captured")
-        return False
-    real_body = sign_ins_bodies[0]
-    print(f"   📨 捕获前端 sign_ins 请求体: {real_body[:400]}")
-
-    # 优先从浏览器真实 sign_ins 响应提取 OAuth URL（与浏览器 client 同源，
-    # state 一定对齐）；提取失败再走 requests 重放兜底。
-    browser_oauth_url = ""
+    # ---- 优先顺序：route 拦截的浏览器跳转 URL > sign_ins 响应里的 URL ----
+    browser_oauth_url = oauth_capture["url"]
     browser_state = ""
     browser_attempt_id = ""
-    _bsd = browser_signin_resp.get("data")
-    if _bsd:
-        _bin = _bsd.get("response", _bsd)
-        browser_attempt_id = _bin.get("id", "")
-        _ffv = _bin.get("first_factor_verification") or {}
-        browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
-        browser_state = _ffv.get("verification_state", "") or ""
-        if browser_oauth_url:
-            print("   🔗 从浏览器 sign_ins 响应直接提取到 OAuth URL（免重放）")
+    if not browser_oauth_url:
+        _bsd = browser_signin_resp.get("data")
+        if _bsd:
+            _bin = _bsd.get("response", _bsd)
+            browser_attempt_id = _bin.get("id", "")
+            _ffv = _bin.get("first_factor_verification") or {}
+            browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
 
-    # ========== 第4步：优先用浏览器同源值，重放仅兜底 ==========
-    print(f"\n📌 第4步：获取 OAuth 信息（优先浏览器同源，重放兜底）")
+    if not browser_oauth_url:
+        print("   ❌ 未能获取浏览器同源 OAuth URL")
+        save_screenshot(page, "oauth_url_not_found")
+        return False
+
+    # state 藏在 OAuth URL 查询参数里，与浏览器会话同源
+    _q = urllib.parse.urlparse(browser_oauth_url).query
+    browser_state = urllib.parse.parse_qs(_q).get("state", [""])[0]
+    print(f"   🔗 从浏览器同源拿到 OAuth URL: {browser_oauth_url[:160]}...")
+    if not browser_state:
+        print("   ⚠️ OAuth URL 中未找到 state，将依赖第5步重新解析")
+
+    # ========== 第4步：直接用同源 OAuth URL，重放仅兜底 ==========
+    print(f"\n📌 第4步：获取 OAuth 信息（浏览器同源，重放兜底）")
     browser_cookies = page.context.cookies()
     cookie_dict = {c["name"]: c["value"] for c in browser_cookies}
 
@@ -325,11 +341,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             timeout=30,
         )
 
-    # ---- 第4.1步：仅在浏览器同源未拿到 OAuth URL/state 时，才用 requests 重放兜底 ----
-    # （重放会新建一个 attempt，state 与浏览器 client 不同源，正是登录被拒的根因，
-    #  所以同源值优先、重放仅兜底）
-    if oauth_url and state:
-        print("   ✅ 同源 OAuth URL + state 已就绪，跳过 sign_ins 重放")
+    # ---- 第4.1步：仅在浏览器同源未拿到 OAuth URL 时，才用 requests 重放兜底 ----
+    # （重放会新建一个 attempt，与浏览器 client 活跃会话不同源，正是登录被拒的根因。
+    #  只要浏览器同源拿到了 OAuth URL 就整段跳过重放；URL 里的 state 会在第5步
+    #  重新解析，无需依赖 verification_state 字段）
+    if oauth_url:
+        print("   ✅ 同源 OAuth URL 已就绪，跳过 sign_ins 重放（避免新建 attempt 导致 state 不同源）")
         data = {}
         inner = {}
     else:
