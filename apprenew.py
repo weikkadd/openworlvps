@@ -205,49 +205,41 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 点击 Sign in 失败: {e}")
 
-    # ========== 第3步：捕获浏览器同源 OAuth 跳转 URL ==========
-    print(f"\n📌 第3步：点击 Discord 并捕获同源 OAuth URL")
-    # 关键修复：Discord OAuth 是在【弹窗 popup】里完成的，主页面 page.route 看不到
-    # popup 的请求，必须用 context.route（覆盖 context 内所有页面含 popup）拦截。
-    # 该 OAuth URL 由 Clerk 前端为【当前浏览器 Clerk client 会话】生成，state 与
-    # 主页面会话 100% 同源。之前用 requests 重放会新建独立 attempt（state 不同源），
-    # 导致回调时 Clerk 校验 state 失败、落到 sign_in_fallback_redirect_url。
+    # ========== 第3步：捕获浏览器 sign_ins 响应，提取同源 OAuth URL ==========
+    print(f"\n📌 第3步：点击 Discord 并捕获 sign_ins 响应中的同源 OAuth URL")
+    # 关键：sign_ins 可能是主页面发出，也可能在弹窗(popup)里发出。必须用
+    # context 级别的 request/response 监听器（覆盖 context 内所有页面含 popup），
+    # 才能稳定抓到 sign_ins 响应。响应体里的
+    # first_factor_verification.external_verification_redirect_url 就是 Clerk 为
+    # 【当前浏览器会话】生成的 Discord OAuth URL，其 state 与浏览器 attempt 同源。
+    # 直接用它 + 跳过 requests 重放，可避免 state 不同源导致 Clerk 拒绝回调。
+    # （不再依赖 page/context.route 拦截 popup 导航，因为该导航形态不稳定。）
     ctx = page.context
-    oauth_capture = {"url": ""}
-
-    def _capture_oauth_route(route, request):
-        u = request.url
-        if "discord.com" in u and "oauth2/authorize" in u:
-            if not oauth_capture["url"]:
-                oauth_capture["url"] = u
-            try:
-                # 只拦截 URL，不真正放行浏览器导航到 Discord（避免 popup 卡在 Discord
-                # 登录页 / CF 挑战，干扰后续 page.goto 回调）。Clerk 的 attempt 已
-                # 在点击 Discord 时创建于浏览器会话中，abort 此导航不会清理它。
-                route.abort()
-            except Exception:
-                pass
-
-    ctx.route("**/discord.com/oauth2/authorize**", _capture_oauth_route)
-
-    # 兜底：监听浏览器 sign_ins 响应，以便 route 未命中时仍能取出 OAuth URL
     sign_ins_bodies = []
-    browser_signin_resp = {}
-    def _capture_signins(req):
-        if req.method == "POST" and "sign_ins" in req.url:
+    browser_signin_data = {}
+
+    def _on_req(req):
+        if req.method == "POST" and "sign_ins" in req.url and "authentications" not in req.url:
             pd = req.post_data
             if pd and pd not in sign_ins_bodies:
                 sign_ins_bodies.append(pd)
-    page.on("request", _capture_signins)
-    def _capture_signins_resp(resp):
-        if "sign_ins" in resp.url and resp.status == 200:
+
+    def _on_resp(resp):
+        u = resp.url
+        if "sign_ins" in u and "authentications" not in u and resp.status == 200:
             try:
                 ct = resp.headers.get("content-type", "")
                 if "json" in ct:
-                    browser_signin_resp["data"] = resp.json()
+                    d = resp.json()
+                    ffv = (d.get("response", d) if isinstance(d, dict) else {}).get(
+                        "first_factor_verification") or {}
+                    if isinstance(ffv, dict) and ffv.get("external_verification_redirect_url"):
+                        browser_signin_data["data"] = d
             except Exception:
                 pass
-    page.on("response", _capture_signins_resp)
+
+    ctx.on("request", _on_req)
+    ctx.on("response", _on_resp)
 
     clicked = False
     for sel in ["button:has-text('Discord')",
@@ -264,37 +256,45 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             continue
 
     wait_start = time.time()
-    while (not oauth_capture["url"]) and (not sign_ins_bodies) and time.time() - wait_start < 30:
+    while (not browser_signin_data) and (not sign_ins_bodies) and time.time() - wait_start < 30:
         time.sleep(0.5)
     time.sleep(2)
-    try:
-        ctx.unroute("**/discord.com/oauth2/authorize**", _capture_oauth_route)
-    except Exception:
-        pass
-    page.remove_listener("request", _capture_signins)
-    page.remove_listener("response", _capture_signins_resp)
+    ctx.remove_listener("request", _on_req)
+    ctx.remove_listener("response", _on_resp)
 
-    # ---- 优先顺序：route 拦截的浏览器跳转 URL > sign_ins 响应里的 URL ----
-    browser_oauth_url = oauth_capture["url"]
+    # 关闭点击 Discord 时可能打开的 popup，避免干扰后续主页面流程
+    for p in ctx.pages:
+        if p != page:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+    if not sign_ins_bodies:
+        print("   ⚠️ 未捕获到 sign_ins 请求体（兜底将无法重放）")
+    else:
+        print(f"   📨 捕获前端 sign_ins 请求体: {sign_ins_bodies[0][:160]}")
+
+    # ---- 从 sign_ins 响应提取同源 OAuth URL（覆盖主页面与 popup） ----
+    browser_oauth_url = ""
     browser_state = ""
     browser_attempt_id = ""
-    if not browser_oauth_url:
-        _bsd = browser_signin_resp.get("data")
-        if _bsd:
-            _bin = _bsd.get("response", _bsd)
-            browser_attempt_id = _bin.get("id", "")
-            _ffv = _bin.get("first_factor_verification") or {}
-            browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
+    _bsd = browser_signin_data.get("data")
+    if _bsd:
+        _bin = _bsd.get("response", _bsd)
+        browser_attempt_id = _bin.get("id", "")
+        _ffv = _bin.get("first_factor_verification") or {}
+        browser_oauth_url = _ffv.get("external_verification_redirect_url", "") or ""
 
     if not browser_oauth_url:
-        print("   ❌ 未能获取浏览器同源 OAuth URL")
+        print("   ❌ 未能从 sign_ins 响应获取同源 OAuth URL")
         save_screenshot(page, "oauth_url_not_found")
         return False
 
     # state 藏在 OAuth URL 查询参数里，与浏览器会话同源
     _q = urllib.parse.urlparse(browser_oauth_url).query
     browser_state = urllib.parse.parse_qs(_q).get("state", [""])[0]
-    print(f"   🔗 从浏览器同源拿到 OAuth URL: {browser_oauth_url[:160]}...")
+    print(f"   🔗 从浏览器 sign_ins 响应拿到同源 OAuth URL: {browser_oauth_url[:160]}...")
     if not browser_state:
         print("   ⚠️ OAuth URL 中未找到 state，将依赖第5步重新解析")
 
@@ -352,8 +352,12 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         data = {}
         inner = {}
     else:
+        if not sign_ins_bodies:
+            print("   ❌ 既无同源 OAuth URL 也无 sign_ins 请求体，无法重放兜底")
+            save_screenshot(page, "no_fallback")
+            return False
         attempt_id = ""
-        resp = _replay_signins(real_body)
+        resp = _replay_signins(sign_ins_bodies[0])
         print(f"   sign_ins 重放: HTTP {resp.status_code}")
         try:
             data = resp.json()
