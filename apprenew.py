@@ -446,6 +446,24 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # ========== 第6步：用回调 URL 完成登录 ==========
     print(f"\n📌 第6步：通过回调 URL 完成登录")
+
+    # [DEBUG-6f3a] 探针：抓取 Clerk oauth_callback / sso-callback 的真实响应，
+    # 以及浏览器控制台报错，直接暴露「Clerk 为什么拒绝这次 OAuth」。
+    _oauth_responses = []
+
+    def _capture_oauth_resp(resp):
+        u = resp.url
+        if "oauth_callback" in u or "sso-callback" in u or "clerk-callback" in u:
+            _oauth_responses.append((resp.status, u))
+            print(f"   [DEBUG-6f3a] 响应 {resp.status}: {u[:220]}")
+
+    def _capture_console(msg):
+        if msg.type in ("error", "warning"):
+            print(f"   [DEBUG-6f3a][console:{msg.type}] {msg.text[:400]}")
+
+    page.on("response", _capture_oauth_resp)
+    page.on("console", _capture_console)
+
     try:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
@@ -466,8 +484,15 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     # 等待 SSO 处理完成并跳回 openworld（fallback redirect_url 为 /login）
     print("   ⏳ 等待 SSO 处理完成并跳回 openworld.eu.org...")
-    for _ in range(30):
+    for _ in range(40):
         cur = page.url
+        # Clerk 拒绝 OAuth 时会回 accounts.openworld.eu.org/sign-in?sign_in_fallback_redirect_url=...
+        # （注意是 '?' 不是 '#/sso-callback'），必须立即识别为失败，否则会空转。
+        if "sign_in_fallback_redirect_url" in cur:
+            print("   ⚠️ oauth_callback 直接落到 sign-in 兜底（Clerk 拒绝了本次 OAuth 授权）")
+            break
+        if "err_code=" in cur:
+            break
         if "accounts.openworld.eu.org" in cur and "sso-callback" in cur:
             time.sleep(1)
             continue
@@ -476,6 +501,16 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         time.sleep(1)
     time.sleep(3)
     print(f"   跳回后 URL: {page.url}")
+
+    # [DEBUG-6f3a] 若仍停在 sign-in 兜底，抓取登录页错误文本，定位拒绝原因
+    if "sign_in_fallback_redirect_url" in page.url or "/login" in page.url:
+        try:
+            body_txt = page.inner_text("body")
+        except Exception:
+            body_txt = ""
+        snippet = body_txt.strip().replace("\n", " ")[:500]
+        if snippet:
+            print(f"   🔍 Clerk 登录页文本: {snippet}")
 
     # SSO 跳回 /login 后，Clerk JS 检测到 session 会自动 POST /auth/clerk-callback
     # 交换真正的面板 session。访问 /dashboard 验证登录态是否建立。
@@ -502,8 +537,15 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         final_url = page.url
         print(f"   重试后 URL: {final_url}")
 
+    page.remove_listener("response", _capture_oauth_resp)
+    page.remove_listener("console", _capture_console)
+
     if "/login" in final_url:
         print(f"   ❌ 登录失败，仍停留在登录页: {final_url}")
+        if _oauth_responses:
+            print("   [DEBUG-6f3a] oauth_callback 相关响应:")
+            for st, u in _oauth_responses:
+                print(f"      - {st}: {u[:200]}")
         save_screenshot(page, "clerk_login_stuck")
         return False
 
